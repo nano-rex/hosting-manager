@@ -11,6 +11,9 @@ moves a site to a new domain, or adds a `www.` name.
 - Every change is checked with `nginx -t` / `apachectl configtest` first; if the check fails,
   the previous config is put back and nothing is reloaded
 - `--dry-run` shows exactly what would be written and run
+- Takes over sites you configured by hand (`adopt`): one file per site, directives kept as they are
+- Moves web files to another folder (e.g. out of `/home`) and switches every site that uses them
+  (`relocate`), checking that each site answers the same before and after
 
 ## Setup
 
@@ -151,6 +154,61 @@ sudo hosting-manager remove example.com                      # files in /var/www
 sudo hosting-manager remove example.com --purge --delete-cert  # also delete files and certificate
 ```
 
+### Take over sites you set up by hand (Apache)
+
+If your Apache sites grew by hand (certbot's `-le-ssl.conf` twins, many sites in one file,
+vhosts hidden in `conf-enabled/`), `adopt` gives every site its own file,
+`sites-available/<domain>.conf`, holding both its HTTP and HTTPS blocks:
+
+```bash
+sudo hosting-manager --dry-run adopt --all     # see the plan first
+sudo hosting-manager adopt --all               # or: adopt example.com shop.example.com
+```
+
+- The directives inside each `<VirtualHost>` are kept exactly, including its port, so the site
+  behaves as before. hosting-manager takes over the names (`ServerName`/`ServerAlias`), the
+  certificate lines and the Let's Encrypt validation path.
+- The old files are taken out of service and kept in `/etc/hosting-manager/backups/<time>-adopted/`.
+- A file that also holds other directives (not just `<VirtualHost>` blocks) is left alone, and so
+  are the sites in it. Sites sharing a file are adopted together.
+- Before anything is reloaded, `apache2ctl configtest` must pass and `apache2ctl -S` must list
+  the same names on the same addresses. After the reload, every site must answer as it did before
+  (status code and redirect target, asked through 127.0.0.1). If any check fails, the whole
+  `/etc/apache2` tree is restored from a backup taken first.
+- The site that answered unknown names before stays the default (its link is named
+  `000-<domain>.conf`). Change that later with `hosting-manager default <domain>`.
+
+Adopted sites show up as type `custom`. `alias`, `ssl`, `rename`, `enable`/`disable`, `remove`
+and `update --root` work on them; `update --php` / `--proxy` replaces their directives.
+
+### Move site files to another folder
+
+`relocate` copies a folder, switches every site whose config mentions it, and checks the sites
+answer the same afterwards:
+
+```bash
+sudo hosting-manager --dry-run relocate /home/olduser/public_html /var/www/olduser/public_html --fix-app-paths
+sudo hosting-manager relocate /home/olduser/public_html /var/www/olduser/public_html --fix-app-paths
+```
+
+- Files are copied with `rsync -aHAX` (owners, permissions, ACLs and links kept), then copied
+  once more just before the switch to pick up changes made in the meantime.
+- Paths are replaced in the site configs, including `open_basedir` and `<Directory>` lines.
+- `--fix-app-paths` also replaces the path inside app files in the copy (`.php`, `.ini`,
+  `.user.ini`, `.htaccess`, `.env`, `.json`, `.yml`, `.xml`, ...; `uploads/` and `cache/` are skipped).
+  The originals are kept in `/etc/hosting-manager/backups/<time>-app-files/`.
+- `--rewrite-confs` also updates other Apache files that mention the folder (shown in the dry run).
+- If the configuration test fails or a site answers differently, the configs are restored and the
+  copy is removed. The old folder is kept until you delete it (or pass `--delete-old`).
+
+### Check that every site still answers
+
+```bash
+sudo hosting-manager check --save /root/sites-before.txt
+# ... change things ...
+sudo hosting-manager check --compare /root/sites-before.txt
+```
+
 ### Preview a change
 
 Put `--dry-run` anywhere in the command to print the config files and commands without
@@ -177,6 +235,10 @@ hosting-manager [--dry-run] [-y] <command> [arguments]
 | `list` | All managed sites |
 | `info <domain>` | Settings, config file path, certificate expiry |
 | `show <domain>` | Print the generated nginx/Apache config |
+| `adopt --all \| <domain>...` | Take over existing Apache sites: one file per site (Apache only) |
+| `relocate <old-dir> <new-dir> [--fix-app-paths] [--rewrite-confs] [--delete-old]` | Copy web files elsewhere and switch the sites using them |
+| `check [--save FILE] [--compare FILE] [<domain>...]` | Status and redirect of each site, or compare with a saved run |
+| `default <domain>` | The site that answers names no other site claims |
 | `ssl <domain> [--staging] [--email ADDR]` | Get a certificate and enable HTTPS |
 | `ssl <domain> --off` | Disable HTTPS (certificate kept) |
 | `renew [--test]` | Run `certbot renew` (`--test` = certbot `--dry-run`) |
@@ -217,17 +279,19 @@ for confirmation).
 | `/etc/apache2/sites-available/<domain>.conf` | Apache site on Debian/Ubuntu |
 | `/etc/httpd/conf.d/<domain>.conf` | Apache site on RHEL-style systems |
 | `/etc/hosting-manager/sites/<domain>.site` | hosting-manager's record of each site |
+| `/etc/hosting-manager/sites/<domain>.http`, `.https` | the kept directives of an adopted site |
 | `/etc/hosting-manager/backups/<time>/` | copies of every file before it was changed |
 | `/etc/hosting-manager/hosting-manager.conf` | defaults set with `config` |
 | `/var/www/_letsencrypt` | shared folder for certificate validation |
 
 Generated configs are regenerated from the site record on every change, so make changes
 with hosting-manager rather than editing them by hand. Sites you configured yourself are left
-alone; hosting-manager only touches the sites it created.
+alone until you `adopt` them; hosting-manager only touches the sites it manages.
 
 ## Testing
 
-`tests/run-tests.sh` builds every kind of site in a temporary sandbox (no root, nothing
+`tests/run-tests.sh` builds every kind of site, adopts hand-made Apache configs and relocates a
+web folder, all in a temporary sandbox (no root, nothing
 outside the sandbox is touched) and checks the output. If nginx and/or Apache are installed,
 it also runs `nginx -t` and `apache2 -t` on the generated configs.
 

@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,7 @@ DEFAULT_SERVER=""
 EMAIL=""
 DRY_RUN=0
 ASSUME_YES=0
+BATCH=0            # 1 = callers test and reload once after many apply_site calls
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -171,11 +172,13 @@ conf_path() {
   esac
 }
 
+# The default site (answers names no site claims) is loaded first: 000-<domain>.conf
 enabled_link() {
-  local server=$1 domain=$2
+  local server=$1 domain=$2 pre=""
+  [[ ${3:-${DEFAULT_SITE:-0}} == 1 ]] && pre="000-"
   case $server in
-    nginx) echo "$ETC/nginx/sites-enabled/$domain.conf" ;;
-    apache) echo "$ETC/apache2/sites-enabled/$domain.conf" ;;
+    nginx) echo "$ETC/nginx/sites-enabled/$pre$domain.conf" ;;
+    apache) echo "$ETC/apache2/sites-enabled/$pre$domain.conf" ;;
   esac
 }
 
@@ -209,11 +212,16 @@ nginx_has_http2_directive() {
 # ---------------------------------------------------------------------------
 # Site state (one shell-quoted key=value file per site)
 # ---------------------------------------------------------------------------
-STATE_KEYS=(DOMAIN SERVER TYPE ROOT TARGET PHP_SOCK ALIASES SSL ENABLED MAX_BODY CREATED)
+STATE_KEYS=(DOMAIN SERVER TYPE ROOT TARGET PHP_SOCK ALIASES SSL ENABLED MAX_BODY CREATED
+            HTTP_ADDR HTTPS_ADDR CERT_FILE CERT_KEY DEFAULT_SITE)
 
+# TYPE=custom (sites taken over with 'adopt') keeps the original directives of
+# each <VirtualHost> in BODY_HTTP / BODY_HTTPS, stored next to the state file.
 reset_site() {
   DOMAIN=""; SERVER=""; TYPE="static"; ROOT=""; TARGET=""; PHP_SOCK=""
   ALIASES=""; SSL=0; ENABLED=1; MAX_BODY=""; CREATED=""
+  HTTP_ADDR=""; HTTPS_ADDR=""; CERT_FILE=""; CERT_KEY=""; DEFAULT_SITE=0
+  BODY_HTTP=""; BODY_HTTPS=""
 }
 
 site_file() { echo "$SITES_DIR/$1.site"; }
@@ -227,6 +235,11 @@ load_site() {
   reset_site
   # shellcheck disable=SC1090
   source "$f"
+  if [[ $TYPE == custom ]]; then
+    [[ -f $SITES_DIR/$domain.http ]] && BODY_HTTP=$(<"$SITES_DIR/$domain.http")
+    [[ -f $SITES_DIR/$domain.https ]] && BODY_HTTPS=$(<"$SITES_DIR/$domain.https")
+  fi
+  return 0
 }
 
 save_site() {
@@ -236,6 +249,27 @@ save_site() {
   done
   write_file "$(site_file "$DOMAIN")" "# $PROG site state; change it with $PROG, not by hand
 ${out%$'\n'}"
+  if [[ $TYPE == custom ]]; then
+    if [[ -n $BODY_HTTP ]]; then write_file "$SITES_DIR/$DOMAIN.http" "$BODY_HTTP"; else remove_file "$SITES_DIR/$DOMAIN.http"; fi
+    if [[ -n $BODY_HTTPS ]]; then write_file "$SITES_DIR/$DOMAIN.https" "$BODY_HTTPS"; else remove_file "$SITES_DIR/$DOMAIN.https"; fi
+    chmod_private "$SITES_DIR/$DOMAIN.http" "$SITES_DIR/$DOMAIN.https"
+  else
+    remove_file "$SITES_DIR/$DOMAIN.http"; remove_file "$SITES_DIR/$DOMAIN.https"
+  fi
+}
+
+# Site records can hold paths and upstream addresses: readable by root only.
+chmod_private() {
+  (( DRY_RUN )) && return 0
+  local f
+  for f in "$@"; do [[ -f $f ]] && chmod 600 "$f"; done
+  return 0
+}
+
+delete_site_record() {
+  remove_file "$(site_file "$1")"
+  remove_file "$SITES_DIR/$1.http"
+  remove_file "$SITES_DIR/$1.https"
 }
 
 all_sites() {
@@ -250,6 +284,11 @@ all_sites() {
 server_names() { echo "$DOMAIN${ALIASES:+ $ALIASES}"; }
 
 cert_exists() { [[ -f $LE_DIR/live/$1/fullchain.pem ]]; }
+
+cert_file() { echo "${CERT_FILE:-$LE_DIR/live/$DOMAIN/fullchain.pem}"; }
+cert_key()  { echo "${CERT_KEY:-$LE_DIR/live/$DOMAIN/privkey.pem}"; }
+http_addr()  { echo "${HTTP_ADDR:-*:80}"; }
+https_addr() { echo "${HTTPS_ADDR:-*:443}"; }
 
 # ---------------------------------------------------------------------------
 # Config rendering
@@ -353,8 +392,8 @@ server {
 $l443$http2
     server_name $names;
 
-    ssl_certificate $LE_DIR/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key $LE_DIR/live/$DOMAIN/privkey.pem;
+    ssl_certificate $(cert_file);
+    ssl_certificate_key $(cert_key);
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:hm_ssl:10m;
     ssl_session_timeout 1d;
@@ -439,7 +478,52 @@ size_to_bytes() {
   esac
 }
 
+# A site taken over with 'adopt': its own directives, plus the names, the
+# certificate and the Let's Encrypt validation path managed here.
+render_apache_custom() {
+  local names acme excl="" alias_line=""
+  [[ -n $ALIASES ]] && alias_line=$'\n'"    ServerAlias $ALIASES"
+  names="    ServerName $DOMAIN$alias_line"
+  acme_block() {
+    local body=$1 out=""
+    grep -qiE '^\s*ProxyPass(Match)?\s' <<<"$body" && out+="    ProxyPass /.well-known/acme-challenge/ !"$'\n'
+    out+="    Alias /.well-known/acme-challenge/ $ACME_ROOT/.well-known/acme-challenge/
+    <Directory $ACME_ROOT>
+        Require all granted
+    </Directory>"
+    printf '%s' "$out"
+  }
+  echo "$HEADER"
+  if [[ -n $BODY_HTTP ]]; then
+    cat <<EOF
+
+<VirtualHost $(http_addr)>
+$names
+$(acme_block "$BODY_HTTP")
+$BODY_HTTP
+</VirtualHost>
+EOF
+  fi
+  if (( SSL )); then
+    local body=${BODY_HTTPS:-$BODY_HTTP} engine=""
+    grep -qiE '^\s*(SSLEngine\s+on|Include\s+\S*options-ssl-apache\.conf)' <<<"$body" || engine=$'\n'"    SSLEngine on"
+    cat <<EOF
+
+<IfModule mod_ssl.c>
+<VirtualHost $(https_addr)>
+$names
+$(acme_block "$body")
+$body$engine
+    SSLCertificateFile $(cert_file)
+    SSLCertificateKeyFile $(cert_key)
+</VirtualHost>
+</IfModule>
+EOF
+  fi
+}
+
 render_apache() {
+  [[ $TYPE == custom ]] && { render_apache_custom; return; }
   local logdir alias_line="" acme
   if [[ $(apache_layout) == confd ]]; then logdir="logs"; else logdir='${APACHE_LOG_DIR}'; fi
   [[ -n $ALIASES ]] && alias_line="    ServerAlias $ALIASES"
@@ -456,7 +540,7 @@ render_apache() {
     cat <<EOF
 $HEADER
 
-<VirtualHost *:80>
+<VirtualHost $(http_addr)>
 $names
 $acme
     RewriteEngine On
@@ -465,11 +549,11 @@ $acme
 </VirtualHost>
 
 <IfModule mod_ssl.c>
-<VirtualHost *:443>
+<VirtualHost $(https_addr)>
 $names
     SSLEngine on
-    SSLCertificateFile $LE_DIR/live/$DOMAIN/fullchain.pem
-    SSLCertificateKeyFile $LE_DIR/live/$DOMAIN/privkey.pem
+    SSLCertificateFile $(cert_file)
+    SSLCertificateKeyFile $(cert_key)
     SSLProtocol -all +TLSv1.2 +TLSv1.3
     Header always set Strict-Transport-Security "max-age=31536000"
 $logs
@@ -482,7 +566,7 @@ EOF
     cat <<EOF
 $HEADER
 
-<VirtualHost *:80>
+<VirtualHost $(http_addr)>
 $names
 $logs
 $acme
@@ -494,8 +578,10 @@ EOF
 
 # Apache modules the site needs (Debian layout enables them with a2enmod).
 apache_modules() {
-  local mods=(rewrite alias)
-  (( SSL )) && mods+=(ssl headers)
+  local mods=(alias)
+  [[ $TYPE == custom ]] || mods+=(rewrite)
+  (( SSL )) && mods+=(ssl)
+  (( SSL )) && [[ $TYPE != custom ]] && mods+=(headers)
   case $TYPE in
     proxy) mods+=(proxy proxy_http headers) ;;
     php) [[ -n $PHP_SOCK ]] && mods+=(proxy proxy_fcgi setenvif) ;;
@@ -549,6 +635,7 @@ apply_site() {
   prepare_dirs
 
   if [[ $server == nginx ]]; then
+    [[ $TYPE == custom ]] && die "$DOMAIN is a custom (adopted) site; those are Apache only"
     [[ $TYPE == proxy ]] && ensure_nginx_globals
     content=$(render_nginx)
   else
@@ -571,6 +658,7 @@ apply_site() {
   if [[ $layout == debian ]]; then
     write_file "$path" "$content"
     link=$(enabled_link "$server" "$DOMAIN")
+    remove_file "$(enabled_link "$server" "$DOMAIN" $(( 1 - DEFAULT_SITE )))"
     if (( ENABLED )); then
       if (( DRY_RUN )); then echo "${C_DIM}+ ln -sfn $path $link${C_RST}"
       else ln -sfn "$path" "$link"; fi
@@ -585,6 +673,7 @@ apply_site() {
     fi
   fi
 
+  (( BATCH )) && return 0
   local out
   if ! out=$(config_test "$server"); then
     printf '%s\n' "$out" >&2
@@ -605,7 +694,8 @@ unapply_site() {
   local server=$SERVER path
   path=$(conf_path "$server" "$DOMAIN")
   if [[ $(server_layout "$server") == debian ]]; then
-    remove_file "$(enabled_link "$server" "$DOMAIN")"
+    remove_file "$(enabled_link "$server" "$DOMAIN" 0)"
+    remove_file "$(enabled_link "$server" "$DOMAIN" 1)"
   fi
   remove_file "$path"
   remove_file "$path.disabled"
@@ -640,7 +730,8 @@ issue_cert() {
   info "requesting a Let's Encrypt certificate for: $(server_names)"
   run certbot certonly --webroot -w "$ACME_ROOT" --cert-name "$DOMAIN" \
     --non-interactive --agree-tos --keep-until-expiring \
-    --deploy-hook "systemctl reload $(server_service "$SERVER")" "${args[@]}"
+    --deploy-hook "systemctl reload $(server_service "$SERVER")" "${args[@]}" || return 1
+  CERT_FILE=""; CERT_KEY=""
 }
 
 # ---------------------------------------------------------------------------
@@ -777,6 +868,13 @@ cmd_update() {
   old_names=$(server_names)
 
   [[ -n $O_SERVER ]] && SERVER=$(pick_server "$O_SERVER")
+  if [[ $TYPE == custom && -n $O_ROOT && -n $ROOT ]]; then
+    BODY_HTTP=$(replace_path "$BODY_HTTP" "$ROOT" "$O_ROOT")
+    BODY_HTTPS=$(replace_path "$BODY_HTTPS" "$ROOT" "$O_ROOT")
+  fi
+  if [[ $TYPE == custom && -n $O_TYPE ]]; then
+    BODY_HTTP=""; BODY_HTTPS=""; HTTP_ADDR=""; HTTPS_ADDR=""
+  fi
   if [[ -n $O_TYPE ]]; then
     TYPE=$O_TYPE
     [[ $TYPE == static || $TYPE == php ]] && ROOT=${ROOT:-$WWW/$DOMAIN}
@@ -802,7 +900,7 @@ cmd_update() {
     info "moving $DOMAIN from $old_server to $SERVER"
     ( SERVER=$old_server; unapply_site; reload_server "$old_server" )
   fi
-  [[ -n $ROOT ]] && placeholder_page "$ROOT" "$DOMAIN"
+  [[ -n $ROOT && $TYPE != custom ]] && placeholder_page "$ROOT" "$DOMAIN"
   info "updating $DOMAIN"
   apply_site
   save_site
@@ -824,6 +922,12 @@ reissue_or_warn() {
   fi
 }
 
+# replace_path TEXT OLD NEW: replace the directory OLD (and paths under it) with NEW.
+replace_path() {
+  local old=${2%/} new=${3%/}
+  printf '%s' "$1" | HM_OLD=$old HM_NEW=$new perl -0777 -pe 's{\Q$ENV{HM_OLD}\E(?=[/"\x27 :;>]|$)}{$ENV{HM_NEW}}gm'
+}
+
 words_without() {
   local w out=()
   for w in $1; do [[ $w == "$2" ]] || out+=("$w"); done
@@ -839,7 +943,10 @@ cmd_list() {
       local ssl=no st=enabled
       (( SSL )) && ssl=yes
       (( ENABLED )) || st=disabled
-      printf '%-32s %-7s %-9s %-5s %-8s %s\n' "$DOMAIN" "$SERVER" "$TYPE" "$ssl" "$st" "${ROOT:-$TARGET}"
+      local where=${ROOT:-$TARGET}
+      [[ -z $where && $TYPE == custom ]] && where=$(grep -m1 -oiE 'ProxyPass\s+/\s+\S+' <<<"$BODY_HTTPS$BODY_HTTP" | awk '{print "-> " $3}' || true)
+      [[ -n $HTTP_ADDR && $HTTP_ADDR != "*:80" ]] && where="[$HTTP_ADDR] $where"
+      printf '%-32s %-7s %-9s %-5s %-8s %s\n' "$DOMAIN" "$SERVER" "$TYPE" "$ssl" "$st" "$where"
       [[ -n $ALIASES ]] && printf '  %saliases: %s%s\n' "$C_DIM" "$ALIASES" "$C_RST"
       true )
   done
@@ -891,7 +998,7 @@ cmd_remove() {
   confirm "Remove $DOMAIN from $SERVER?" || die "aborted"
   unapply_site
   reload_server "$SERVER"
-  remove_file "$(site_file "$DOMAIN")"
+  delete_site_record "$DOMAIN"
   if (( delcert )) && cert_exists "$DOMAIN"; then run certbot delete --non-interactive --cert-name "$DOMAIN"; fi
   if (( purge )) && [[ -n $ROOT && -d $ROOT ]]; then
     [[ $ROOT == / || $ROOT == "$WWW" ]] && die "refusing to delete $ROOT"
@@ -929,7 +1036,7 @@ cmd_rename() {
 
   info "renaming $old -> $new"
   # 1. the new site, plain HTTP first so certbot can validate it
-  DOMAIN=$new; ALIASES="${new_aliases[*]}"; SSL=0
+  DOMAIN=$new; ALIASES="${new_aliases[*]}"; SSL=0; CERT_FILE=""; CERT_KEY=""
   if [[ -n $old_root && $old_root == "$WWW/$old" && $keep_root == 0 ]]; then
     ROOT="$WWW/$new"
     if [[ -d $old_root ]]; then
@@ -951,11 +1058,11 @@ cmd_rename() {
   ( load_site "$old"
     unapply_site
     if (( redirect )); then
-      TYPE=redirect; TARGET=$new_url; ROOT=""; PHP_SOCK=""
+      TYPE=redirect; TARGET=$new_url; ROOT=""; PHP_SOCK=""; BODY_HTTP=""; BODY_HTTPS=""
       apply_site; save_site
       info "$old now redirects to $new_url"
     else
-      remove_file "$(site_file "$old")"
+      delete_site_record "$old"
       reload_server "$SERVER"
       if (( delcert )) && cert_exists "$old"; then run certbot delete --non-interactive --cert-name "$old"; fi
     fi )
@@ -1129,6 +1236,475 @@ EMAIL=$(printf '%q' "$EMAIL")"
   info "$key set to ${val:-(unset)}"
 }
 
+# ---------------------------------------------------------------------------
+# Safety net for changes to many sites: whole-tree backup, probes before/after
+# ---------------------------------------------------------------------------
+apache_dir() { if [[ $(apache_layout) == confd ]]; then echo "$ETC/httpd"; else echo "$ETC/apache2"; fi; }
+
+# Archive the Apache tree and the site records; restore_tree puts both back.
+backup_tree() {
+  TREE_BACKUP="$BACKUP_DIR/$STAMP-$1.tgz"
+  (( DRY_RUN )) && return 0
+  mkdir -p "$BACKUP_DIR"
+  local dirs=("$(basename "$(apache_dir)")")
+  [[ -d $STATE_DIR ]] && dirs+=("$(basename "$STATE_DIR")")
+  tar czf "$TREE_BACKUP" -C "$ETC" --exclude="$(basename "$STATE_DIR")/backups" "${dirs[@]}"
+  chmod 600 "$TREE_BACKUP"
+  info "backup: $TREE_BACKUP"
+}
+
+restore_tree() {
+  [[ -n ${TREE_BACKUP:-} && -f $TREE_BACKUP ]] || return 0
+  warn "restoring $TREE_BACKUP"
+  rm -rf "$(apache_dir)"
+  find "$SITES_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  tar xzf "$TREE_BACKUP" -C "$ETC"
+  if [[ $FAKE != 1 ]] && config_test apache >/dev/null 2>&1; then reload_server apache || true; fi
+}
+
+# URLs of the loaded site: "url port name"
+site_urls() {
+  local port
+  if [[ $TYPE != custom || -n $BODY_HTTP ]]; then
+    port=$(http_addr); port=${port##*:}
+    echo "http://$DOMAIN:$port/ $port $DOMAIN"
+  fi
+  if (( SSL )); then
+    port=$(https_addr); port=${port##*:}
+    echo "https://$DOMAIN:$port/ $port $DOMAIN"
+  fi
+}
+
+# Read "url port name" lines; print "url status redirect" for each, asking this
+# server directly (127.0.0.1) so DNS doesn't matter.
+probe_urls() {
+  [[ $FAKE == 1 ]] && { cat >/dev/null; return 0; }
+  have curl || die "curl is needed for the checks"
+  xargs -r -P 16 -L 1 sh -c 'printf "%s %s\n" "$1" "$(curl -sk -o /dev/null -m 20 -w "%{http_code} %{redirect_url}" --resolve "$3:$2:127.0.0.1" "$1")"' _ | sort
+}
+
+# compare_probes BEFORE AFTER: differences are probed once more before failing.
+compare_probes() {
+  local before=$1 after=$2 diffs
+  diffs=$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed -n 's/^> //p' | awk '{print $1}')
+  [[ -z $diffs ]] && return 0
+  sleep 3
+  local again url bad=0
+  again=$(while read -r url; do
+    local port host
+    host=${url#*://}; host=${host%%[:/]*}
+    port=${url#*://*:}; port=${port%%/*}
+    echo "$url $port $host"
+  done <<<"$diffs" | probe_urls)
+  while read -r url; do
+    local b a
+    b=$(grep -F "$url " <<<"$before" | head -1 || true)
+    a=$(grep -F "$url " <<<"$again" | head -1 || true)
+    if [[ $b != "$a" ]]; then warn "changed: ${b:-$url (new)}  ->  ${a#"$url "}"; bad=1; fi
+  done <<<"$diffs"
+  return $bad
+}
+
+# Names served on each address, from apache2ctl -S (for before/after comparison).
+vhost_names() {
+  local cmd=${HM_APACHE_S:-}    # test hook: command printing apache2ctl -S output
+  if [[ -z $cmd ]]; then
+    [[ $FAKE == 1 ]] && return 0
+    cmd=apachectl; have apache2ctl && cmd=apache2ctl
+    cmd="$cmd -S"
+  fi
+  eval "$cmd" 2>/dev/null | awk '
+    /^[^ ]+:[0-9]+ +is a NameVirtualHost/ {addr=$1; next}
+    /^[^ ]+:[0-9]+ +[^ ]+ +\(/            {print $1, $2; next}
+    /port [0-9]+ namevhost/               {print addr, $4; next}
+    /default server /                     {print addr, "default", $3; next}
+    /^ +alias /                           {print addr, "alias", $2}' | sort -u
+}
+
+# default <domain>: make it the site that answers names nobody else claims
+cmd_default() {
+  [[ $# -eq 1 ]] || die "usage: $PROG default <domain>"
+  need_root
+  local d target=${1,,}
+  site_exists "$target" || die "no managed site named $target"
+  BATCH=1
+  for d in $(all_sites); do
+    load_site "$d"
+    local want=0; [[ $d == "$target" ]] && want=1
+    [[ $DEFAULT_SITE == "$want" ]] && continue
+    DEFAULT_SITE=$want; apply_site; save_site
+  done
+  BATCH=0
+  local out; out=$(config_test "$SERVER") || { printf '%s\n' "$out" >&2; die "configuration test failed"; }
+  reload_server "$SERVER"
+  info "$target now answers requests for unknown names"
+}
+
+cmd_check() {
+  local save="" compare="" names=() d
+  while (($#)); do
+    case $1 in
+      --save) save=$2; shift ;;
+      --compare) compare=$2; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) names+=("${1,,}") ;;
+    esac; shift
+  done
+  (( ${#names[@]} )) || mapfile -t names < <(all_sites)
+  local out
+  out=$(for d in "${names[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
+  if [[ -n $save ]]; then printf '%s\n' "$out" > "$save"; info "saved $(wc -l <<<"$out") results to $save"; fi
+  if [[ -n $compare ]]; then
+    [[ -f $compare ]] || die "no such file: $compare"
+    if compare_probes "$(<"$compare")" "$out"; then info "every site answers as in $compare"
+    else die "some sites answer differently"; fi
+  fi
+  [[ -n $save || -n $compare ]] || printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# adopt: take existing Apache vhosts over, one file per site
+# ---------------------------------------------------------------------------
+# Enabled config files, in Apache's load order: "kind link realpath"
+apache_sources() {
+  local d f
+  if [[ $(apache_layout) == confd ]]; then
+    for f in "$ETC"/httpd/conf.d/*.conf; do [[ -f $f ]] && echo "conf.d $f $f"; done
+    return 0
+  fi
+  for d in conf-enabled sites-enabled; do
+    for f in "$ETC/apache2/$d"/*.conf; do
+      [[ -e $f ]] || continue
+      echo "$d $f $(readlink -f "$f")"
+    done
+  done
+}
+
+# Parse one config file into vhost records (see adopt_scan).
+parse_vhosts() {
+  awk -v F="$1" '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    BEGIN { inv = 0; other = 0 }
+    {
+      line = $0; sub(/\r$/, "", line); l = tolower(trim(line))
+      if (!inv) {
+        if (l ~ /^<virtualhost[ \t>]/) {
+          inv = 1; addr = trim(line); sub(/^<[Vv][Ii][Rr][Tt][Uu][Aa][Ll][Hh][Oo][Ss][Tt][ \t]+/, "", addr); sub(/>.*$/, "", addr)
+          name = ""; aliases = ""; ssl = (addr ~ /:443$/); cert = ""; key = ""; doc = ""; nb = 0
+          next
+        }
+        if (l ~ /^<ifmodule[ \t]+mod_ssl\.c>$/ || l ~ /^<\/ifmodule>$/) next
+        if (l == "" || l ~ /^#/) next
+        other++; next
+      }
+      if (l ~ /^<\/virtualhost>/) {
+        inv = 0
+        printf "V\037%s\037%s\037%s\037%s\037%d\037%s\037%s\037%s\n", F, addr, name, trim(aliases), ssl, cert, key, doc
+        for (i = 1; i <= nb; i++) print "B\t" body[i]
+        print "E"
+        next
+      }
+      n = split(trim(line), w, /[ \t]+/)
+      k = tolower(w[1])
+      if (k == "servername") { name = tolower(w[2]); sub(/:[0-9]+$/, "", name); sub(/^https?:\/\//, "", name); next }
+      if (k == "serveralias") { for (i = 2; i <= n; i++) aliases = aliases " " tolower(w[i]); next }
+      if (k == "sslcertificatefile") { cert = w[2]; ssl = 1; next }
+      if (k == "sslcertificatekeyfile") { key = w[2]; next }
+      if (k == "sslengine" && tolower(w[2]) == "on") ssl = 1
+      if (k == "documentroot") { doc = w[2]; gsub(/"/, "", doc) }
+      body[++nb] = line
+    }
+    END { if (inv) other++; printf "O\t%s\t%d\n", F, other }' "$1"
+}
+
+cmd_adopt() {
+  local all=0 want=() a
+  for a in "$@"; do
+    case $a in
+      --all) all=1 ;;
+      -*) die "unknown option: $a" ;;
+      *) check_domain "$a"; want+=("${a,,}") ;;
+    esac
+  done
+  (( all || ${#want[@]} )) || die "usage: $PROG adopt --all | <domain>..."
+  [[ $(apache_layout) != none ]] || die "adopt works with Apache configs; Apache was not found"
+  need_root
+
+  # --- scan
+  local -A src_of=() src_other=() links_of=() mode_of=()
+  local -A h_addr=() h_body=() h_n=() s_addr=() s_body=() s_n=() s_cert=() s_key=() aliases_of=() root_of=() vh_of_src=()
+  local names=() kind link real rec
+  local adir; adir=$(apache_dir)
+  while read -r kind link real; do
+    if [[ $real != "$adir"/* ]]; then
+      warn "$link points outside $adir ($real); left alone"
+      continue
+    fi
+    links_of[$real]+="$link "
+    [[ -n ${src_other[$real]+x} ]] && continue
+    src_other[$real]=0
+    mode_of[$real]=$(stat -c %a "$real" 2>/dev/null || echo 644)
+    local cur="" curssl=0 body=""
+    while IFS= read -r rec; do
+      case ${rec:0:1} in
+        V)
+          IFS=$'\037' read -r _ _ v_addr v_name v_alias v_ssl v_cert v_key v_doc <<<"$rec"
+          cur=$v_name; curssl=$v_ssl; body="" ;;
+        B) body+=${rec#B$'\t'}$'\n' ;;
+        E)
+          if [[ -z $cur ]]; then
+            warn "${real}: a <VirtualHost $v_addr> without ServerName is left alone"
+            src_other[$real]=$(( src_other[$real] + 1 )); continue
+          fi
+          vh_of_src[$real]+="$cur "
+          [[ " ${names[*]} " == *" $cur "* ]] || names+=("$cur")
+          src_of[$cur]+="$real "
+          [[ -n $v_alias ]] && aliases_of[$cur]=$(printf '%s\n' ${aliases_of[$cur]:-} $v_alias | awk '!seen[$0]++' | paste -sd' ')
+          [[ -n $v_doc && -z ${root_of[$cur]:-} ]] && root_of[$cur]=$v_doc
+          if (( curssl )); then
+            s_n[$cur]=$(( ${s_n[$cur]:-0} + 1 )); s_addr[$cur]=$v_addr; s_body[$cur]=${body%$'\n'}
+            s_cert[$cur]=$v_cert; s_key[$cur]=$v_key
+          else
+            h_n[$cur]=$(( ${h_n[$cur]:-0} + 1 )); h_addr[$cur]=$v_addr; h_body[$cur]=${body%$'\n'}
+          fi ;;
+        O) src_other[$real]=$(( src_other[$real] + ${rec##*$'\t'} )) ;;
+      esac
+    done < <(parse_vhosts "$real")
+  done < <(apache_sources)
+
+  # --- choose
+  local pick=() n f bad
+  if (( all )); then pick=("${names[@]}"); else pick=("${want[@]}"); fi
+  local -A chosen=()
+  for n in "${pick[@]}"; do
+    [[ -n ${src_of[$n]:-} ]] || { warn "$n: no enabled <VirtualHost> with that ServerName"; continue; }
+    if site_exists "$n"; then warn "$n is already managed; skipped"; continue; fi
+    if (( ${h_n[$n]:-0} > 1 || ${s_n[$n]:-0} > 1 )); then warn "$n has more than one HTTP or HTTPS block; skipped (merge them by hand first)"; continue; fi
+    bad=""
+    for f in ${src_of[$n]}; do (( src_other[$f] )) && bad=$f; done
+    if [[ -n $bad ]]; then warn "$n: $bad also holds other directives; skipped (move them out first)"; continue; fi
+    chosen[$n]=1
+  done
+  # a file can only be retired when every site in it is adopted
+  local again=1
+  while (( again )); do
+    again=0
+    for n in "${!chosen[@]}"; do
+      for f in ${src_of[$n]}; do
+        local m
+        for m in ${vh_of_src[$f]}; do
+          if [[ -z ${chosen[$m]:-} ]]; then
+            warn "$n shares $f with $m, which is not being adopted; skipped (adopt them together)"
+            unset "chosen[$n]"; again=1; continue 3
+          fi
+        done
+      done
+    done
+  done
+  (( ${#chosen[@]} )) || die "nothing to adopt"
+  local sel; sel=$(printf '%s\n' "${!chosen[@]}" | sort)
+  local files; files=$(for n in $sel; do printf '%s\n' ${src_of[$n]}; done | sort -u)
+
+  info "adopting $(wc -l <<<"$sel") site(s) from $(wc -l <<<"$files") file(s):"
+  for n in $sel; do
+    local what="" port
+    [[ -n ${h_addr[$n]:-} ]] && what+="http(${h_addr[$n]}) "
+    [[ -n ${s_addr[$n]:-} ]] && what+="https(${s_addr[$n]}) "
+    printf '  %-45s %s%s\n' "$n" "$what" "${aliases_of[$n]:+ aliases: ${aliases_of[$n]}}"
+  done
+  echo "files taken out of service (kept in $BACKUP_DIR/$STAMP-adopted/):"
+  printf '  %s\n' $files
+
+  # --- before
+  local before_names="" before=""
+  if ! (( DRY_RUN )); then
+    before_names=$(vhost_names)
+    before=$(for n in $sel; do
+      if [[ -n ${h_addr[$n]:-} ]]; then echo "http://$n:${h_addr[$n]##*:}/ ${h_addr[$n]##*:} $n"; fi
+      if [[ -n ${s_addr[$n]:-} ]]; then echo "https://$n:${s_addr[$n]##*:}/ ${s_addr[$n]##*:} $n"; fi
+    done | probe_urls)
+  fi
+  backup_tree adopt
+  trap 'restore_tree' ERR
+
+  # --- take the old files out of service
+  local keep="$BACKUP_DIR/$STAMP-adopted"
+  for f in $files; do
+    for link in ${links_of[$f]}; do
+      [[ $link == "$f" ]] && continue
+      if (( DRY_RUN )); then echo "${C_DIM}+ rm $link${C_RST}"; else rm -f "$link"; fi
+    done
+    if (( DRY_RUN )); then echo "${C_DIM}+ mv $f $keep/${C_RST}"
+    else mkdir -p "$keep"; mv "$f" "$keep/$(basename "$(dirname "$f")")--$(basename "$f")"; fi
+  done
+
+  # --- one managed file per site
+  BATCH=1
+  for n in $sel; do
+    reset_site
+    DOMAIN=$n; SERVER=apache; TYPE=custom; CREATED=$(date -Iseconds)
+    ALIASES=${aliases_of[$n]:-}
+    ROOT=${root_of[$n]:-}
+    BODY_HTTP=${h_body[$n]:-}; [[ -n ${h_addr[$n]:-} ]] && HTTP_ADDR=${h_addr[$n]}
+    [[ -n ${h_addr[$n]:-} && -z $BODY_HTTP ]] && BODY_HTTP="    # (no directives)"
+    if [[ -n ${s_addr[$n]:-} ]]; then
+      SSL=1; HTTPS_ADDR=${s_addr[$n]}; BODY_HTTPS=${s_body[$n]}
+      CERT_FILE=${s_cert[$n]}; CERT_KEY=${s_key[$n]}
+      [[ $CERT_FILE == "$LE_DIR/live/$n/fullchain.pem" ]] && CERT_FILE=""
+      [[ $CERT_KEY == "$LE_DIR/live/$n/privkey.pem" ]] && CERT_KEY=""
+    fi
+    grep -qE " default $n\$" <<<"$before_names" && DEFAULT_SITE=1
+    [[ $HTTP_ADDR == "*:80" ]] && HTTP_ADDR=""
+    [[ $HTTPS_ADDR == "*:443" ]] && HTTPS_ADDR=""
+    apply_site
+    save_site
+    local m=644 sf
+    for sf in ${src_of[$n]}; do [[ ${mode_of[$sf]} == 640 || ${mode_of[$sf]} == 600 ]] && m=640; done
+    (( DRY_RUN )) || chmod "$m" "$(conf_path apache "$n")"
+  done
+  BATCH=0
+
+  if (( DRY_RUN )); then trap - ERR; info "dry run: nothing was changed"; return 0; fi
+  local out
+  if ! out=$(config_test apache); then
+    printf '%s\n' "$out" >&2; restore_tree; trap - ERR; die "configuration test failed; everything was put back"
+  fi
+  local after_names; after_names=$(vhost_names)
+  # one name list per site: an alias that was on only one of a site's blocks
+  # (e.g. HTTP) is now on both; that is the only difference allowed
+  local known; known=$(for n in $sel; do printf '%s\n' ${aliases_of[$n]:-}; done)
+  local extra; extra=$(diff <(echo "$before_names") <(echo "$after_names") | sed -n 's/^> //p' |
+    awk -v k="$known" 'BEGIN{split(k,a,"\n"); for(i in a) ok[a[i]]=1} !($2=="alias" && ok[$3])' || true)
+  local missing; missing=$(diff <(echo "$before_names") <(echo "$after_names") | sed -n 's/^< //p' || true)
+  if [[ -n $extra || -n $missing ]]; then
+    [[ -n $missing ]] && printf 'no longer served: %s\n' $missing >&2
+    [[ -n $extra ]] && printf '%s\n' "$extra" | sed 's/^/newly served: /' >&2
+    restore_tree; trap - ERR; die "Apache would serve a different set of names; everything was put back"
+  fi
+  reload_server apache
+  sleep 2
+  local after; after=$(for n in $sel; do ( load_site "$n"; site_urls ); done | probe_urls)
+  if ! compare_probes "$before" "$after"; then
+    restore_tree; trap - ERR; die "some sites answered differently; everything was put back"
+  fi
+  trap - ERR
+  info "adopted $(wc -l <<<"$sel") site(s); each is now $(dirname "$(conf_path apache x)")/<domain>.conf"
+}
+
+# ---------------------------------------------------------------------------
+# relocate: move web files to another directory and update every site using them
+# ---------------------------------------------------------------------------
+APP_FILE_GLOBS=(--include='*.php' --include='*.inc' --include='*.ini' --include='.user.ini' --include='.htaccess'
+                --include='*.json' --include='.env' --include='*.env' --include='*.conf' --include='*.yml' --include='*.yaml'
+                --include='*.xml' --include='*.cfg' --include='*.config')
+
+app_files_with() {   # app_files_with DIR PREFIX
+  grep -rlIF "${APP_FILE_GLOBS[@]}" --exclude-dir=uploads --exclude-dir=cache -e "$2" "$1" 2>/dev/null || true
+}
+
+cmd_relocate() {
+  [[ $# -ge 2 ]] || die "usage: $PROG relocate <old-dir> <new-dir> [--fix-app-paths] [--rewrite-confs] [--delete-old]"
+  local old=${1%/} new=${2%/} fix=0 confs=0 del=0; shift 2
+  while (($#)); do
+    case $1 in
+      --fix-app-paths) fix=1 ;;
+      --rewrite-confs) confs=1 ;;
+      --delete-old) del=1 ;;
+      *) die "unknown option: $1" ;;
+    esac; shift
+  done
+  [[ $old == /* && $new == /* ]] || die "use absolute paths"
+  [[ -d $old ]] || die "$old is not a directory"
+  [[ -e $new ]] && die "$new already exists"
+  [[ $new == "$old"/* ]] && die "$new is inside $old"
+  need_root
+
+  local sites=() d
+  for d in $(all_sites); do
+    ( load_site "$d"; [[ $(replace_path "$ROOT$BODY_HTTP$BODY_HTTPS" "$old" "$new") != "$ROOT$BODY_HTTP$BODY_HTTPS" ]] ) && sites+=("$d")
+  done
+  local others=() f
+  while read -r _ _ f; do
+    [[ -f $f ]] || continue
+    grep -qF "$old" "$f" && others+=("$f")
+  done < <(apache_sources)
+  for d in "${sites[@]}"; do others=("${others[@]/"$(conf_path apache "$d")"}"); done
+  mapfile -t others < <(printf '%s\n' "${others[@]}" | grep . | sort -u)
+
+  info "relocating $old -> $new ($(du -sh "$old" 2>/dev/null | cut -f1))"
+  echo "sites using it (${#sites[@]}):"; printf '  %s\n' "${sites[@]:-(none)}"
+  if (( ${#others[@]} )); then
+    if (( confs )); then echo "other Apache files to update:"; else echo "other Apache files that mention it (not changed; add --rewrite-confs):"; fi
+    printf '  %s\n' "${others[@]}"
+  fi
+  local apps; apps=$(app_files_with "$old" "$old")
+  if [[ -n $apps ]]; then
+    if (( fix )); then echo "app files with the path written in them, fixed in the copy:"
+    else echo "app files with the path written in them (not changed; add --fix-app-paths):"; fi
+    sed "s|^$old|  $new|" <<<"$apps"
+  fi
+  (( DRY_RUN )) && { info "dry run: nothing was changed"; return 0; }
+  (( ${#sites[@]} + ${#others[@]} )) || warn "no site uses $old; only copying"
+  confirm "Copy $old to $new and switch the sites over?" || die "aborted"
+
+  local before; before=$(for d in "${sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
+
+  local parent; parent=$(dirname "$new")
+  [[ -d $parent ]] || { mkdir -p "$parent"; chmod 755 "$parent"; }
+  copy_tree() {
+    if have rsync; then rsync -aHAX --numeric-ids --delete "$old/" "$new/"
+    else mkdir -p "$new"; cp -a "$old/." "$new/"; fi
+  }
+  info "copying files"
+  copy_tree
+  info "copying changes made meanwhile"
+  copy_tree
+  chmod --reference="$old" "$new"
+
+  if (( fix )) && [[ -n $apps ]]; then
+    local rel
+    while read -r f; do
+      rel=${f#"$old"/}
+      mkdir -p "$BACKUP_DIR/$STAMP-app-files/$(dirname "$rel")"
+      cp -a "$new/$rel" "$BACKUP_DIR/$STAMP-app-files/$rel"
+      HM_OLD=$old HM_NEW=$new perl -pi -e 's{\Q$ENV{HM_OLD}\E(?=[/"\x27 :;>]|$)}{$ENV{HM_NEW}}g' "$new/$rel"
+    done <<<"$apps"
+    info "fixed $(wc -l <<<"$apps") app file(s); originals in $BACKUP_DIR/$STAMP-app-files/"
+  fi
+
+  backup_tree relocate
+  fail_back() { restore_tree; rm -rf -- "$new"; die "$1; everything was put back and $new removed"; }
+  BATCH=1
+  for d in "${sites[@]}"; do
+    load_site "$d"
+    ROOT=$(replace_path "$ROOT" "$old" "$new")
+    BODY_HTTP=$(replace_path "$BODY_HTTP" "$old" "$new")
+    BODY_HTTPS=$(replace_path "$BODY_HTTPS" "$old" "$new")
+    apply_site || fail_back "could not update $d"
+    save_site
+  done
+  BATCH=0
+  if (( confs )); then
+    for f in "${others[@]}"; do
+      backup_file "$f"
+      local t; t=$(replace_path "$(<"$f")" "$old" "$new")
+      printf '%s\n' "$t" > "$f"
+    done
+  fi
+  local out
+  out=$(config_test apache) || { printf '%s\n' "$out" >&2; fail_back "configuration test failed"; }
+  reload_server apache
+  sleep 2
+  local after; after=$(for d in "${sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
+  compare_probes "$before" "$after" || fail_back "some sites answered differently"
+  info "done: ${#sites[@]} site(s) now use $new"
+  if (( del )); then
+    run rm -rf -- "$old"; info "removed $old"
+  else
+    info "the old copy is still in $old; remove it once you're happy (or rerun with --delete-old)"
+  fi
+}
+
 usage() {
   cat <<EOF
 $PROG $VERSION - easy nginx/Apache hosting on a Linux server
@@ -1158,6 +1734,14 @@ Sites
   list                            all managed sites
   info <domain>                   settings, config path, certificate expiry
   show <domain>                   print the generated server config
+  adopt --all | <domain>...       take over existing (hand-made) Apache sites: one file per
+                                  site, directives kept as they are (Apache only)
+  relocate <old-dir> <new-dir>    copy web files elsewhere and switch every site using them
+      --fix-app-paths             also rewrite the path inside app files (.php, .ini, .env, ...)
+      --rewrite-confs             also rewrite other Apache files that mention it
+      --delete-old                delete <old-dir> after a successful switch
+  check [--save F] [--compare F]  how each site answers (status, redirect), or compare with F
+  default <domain>                the site that answers names no other site claims
 
 Certificates (Let's Encrypt via certbot)
   ssl <domain> [--staging] [--email ADDR]   enable HTTPS
@@ -1224,6 +1808,10 @@ main() {
     test) cmd_test ;;
     reload) cmd_reload ;;
     config) cmd_config "$@" ;;
+    adopt|import) cmd_adopt "$@" ;;
+    relocate) cmd_relocate "$@" ;;
+    check) cmd_check "$@" ;;
+    default) cmd_default "$@" ;;
     help|-h|--help) usage ;;
     version|-V|--version) echo "$PROG $VERSION" ;;
     *) die "unknown command '$cmd' (see: $PROG help)" ;;
