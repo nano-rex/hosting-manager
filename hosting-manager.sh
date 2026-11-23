@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -1673,7 +1673,10 @@ cmd_relocate() {
   (( ${#sites[@]} + ${#others[@]} )) || warn "no site uses $old; only copying"
   confirm "Copy $old to $new and switch the sites over?" || die "aborted"
 
-  local before; before=$(for d in "${sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
+  # services restarted from the new place may sit behind any site: check them all
+  local probe_sites=("${sites[@]}")
+  if (( units && ${#unit_files[@]} )); then mapfile -t probe_sites < <(all_sites); fi
+  local before; before=$(for d in "${probe_sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
 
   local parent; parent=$(dirname "$new")
   [[ -d $parent ]] || { mkdir -p "$parent"; chmod 755 "$parent"; }
@@ -1752,8 +1755,18 @@ cmd_relocate() {
     info "services moved: ${services[*]}"
   fi
   sleep 2
-  local after; after=$(for d in "${sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
-  compare_probes "$before" "$after" || fail_back "some sites answered differently"
+  # restarted apps can take a while to start: keep checking for up to HM_WAIT seconds
+  local waited=0 limit=${HM_WAIT:-90} after
+  while :; do
+    after=$(for d in "${probe_sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
+    compare_probes "$before" "$after" 2>/dev/null && break
+    if (( ! units || ${#unit_files[@]} == 0 || waited >= limit )); then
+      compare_probes "$before" "$after" || true
+      fail_back "some sites answered differently"
+    fi
+    sleep 5; waited=$(( waited + 8 ))
+    info "waiting for the restarted services to answer (${waited}s)"
+  done
   info "done: ${#sites[@]} site(s) now use $new"
   if (( del )); then
     run rm -rf -- "$old"; info "removed $old"
