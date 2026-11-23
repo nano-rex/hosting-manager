@@ -113,6 +113,18 @@ hm update blog.legacy.test --root "$T/home/legacy/public_html/blog"
 mkdir -p "$T/etc/systemd/system" "$T/home/legacy/api"
 printf '[Service]\nWorkingDirectory=%s/home/legacy/api\nExecStart=/usr/bin/dotnet %s/home/legacy/api/API.dll\n' "$T" "$T" > "$T/etc/systemd/system/legacy-api.service"
 hm -y relocate "$T/home/legacy" "$T/www/legacy" --fix-app-paths --rewrite-units
+# --wait-dns: waits while the name doesn't resolve, then renames; units get the host name
+printf '[Service]\nWorkingDirectory=/srv/hub.legacy.test\nExecStart=/usr/bin/hub -r hub.legacy.test:21117\n' > "$T/etc/systemd/system/hub.service"
+hm create hub.legacy.test --server apache --proxy 7000 --ssl --no-www
+cert hub.newname.test; cert keep.legacy.test
+: > "$T/dns"
+( sleep 3; echo "hub.newname.test 192.0.2.7" > "$T/dns" ) &
+HM_FAKE_DNS=$T/dns HM_DNS_POLL=1 hm rename hub.legacy.test hub.newname.test --wait-dns --expect-ip 192.0.2.7 --rewrite-units --delete-old-cert
+wait
+# a failed certificate must leave the old site exactly as it was
+hm create keep.legacy.test --server apache --proxy 7001 --ssl --no-www
+cp "$T/etc/apache2/sites-available/keep.legacy.test.conf" "$T/keep-before.conf"
+HM_FAKE_CERT_FAIL=1 hm rename keep.legacy.test keep.newname.test || true
 # rename an adopted HTTPS site whose directives mention its own name
 hm rename pay.legacy.test pay.newname.test --force
 
@@ -134,7 +146,7 @@ check "apache php handler"               "grep -q 'proxy:unix:/run/php/php-fpm.s
 check "apache https upstream"            "grep -q 'SSLProxyEngine on' $a/sites-available/a-proxy.test.conf"
 check "apache upload limit"              "grep -q 'LimitRequestBody 10485760' $a/sites-available/a-plain.test.conf"
 check "apache rename without redirect"   "[[ ! -e $a/sites-available/a-old.test.conf && -f $a/sites-available/a-new.test.conf ]]"
-check "list shows 17 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 17 ]]"
+check "list shows 19 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 19 ]]"
 check "adopt: one file per site"         "[[ -f $a/sites-available/shop.legacy.test.conf && -f $a/sites-available/blog.legacy.test.conf ]]"
 check "adopt: port and directives kept"  "grep -q '<VirtualHost \*:3000>' $a/sites-available/shop.legacy.test.conf && grep -q 'php_admin_value open_basedir' $a/sites-available/shop.legacy.test.conf"
 check "adopt: aliases kept"              "grep -q 'ServerAlias www.shop.legacy.test' $a/sites-available/shop.legacy.test.conf"
@@ -153,6 +165,9 @@ check "relocate: service rewritten"     "grep -q 'WorkingDirectory=$T/www/legacy
 check "rename adopted: names in body"    "grep -q 'RewriteCond %{SERVER_NAME} =pay.newname.test' $a/sites-available/pay.newname.test.conf && grep -q 'ServerAlias www.pay.newname.test' $a/sites-available/pay.newname.test.conf"
 check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
 check "check is its own command"         "bash $HM check >/dev/null 2>&1 && ! bash $HM check | grep -q '^hosting-manager '"
+check "wait-dns: renamed after DNS"     "[[ -f $a/sites-available/hub.newname.test.conf && ! -e $a/sites-available/hub.legacy.test.conf ]] && grep -q 'SSLCertificateFile $T/le/live/hub.newname.test' $a/sites-available/hub.newname.test.conf"
+check "units: host name, not path"       "grep -q 'ExecStart=/usr/bin/hub -r hub.newname.test:21117' $T/etc/systemd/system/hub.service && grep -q 'WorkingDirectory=/srv/hub.legacy.test' $T/etc/systemd/system/hub.service"
+check "failed cert: old site untouched"  "cmp -s $T/keep-before.conf $a/sites-available/keep.legacy.test.conf && [[ ! -e $a/sites-available/keep.newname.test.conf && ! -e $T/etc/hosting-manager/sites/keep.newname.test.site ]]"
 check "relocate: old copy kept"          "[[ -f $T/home/legacy/public_html/shop/config.php ]]"
 
 NGINX=$(command -v nginx || ls /usr/sbin/nginx 2>/dev/null || true)

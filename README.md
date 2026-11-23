@@ -115,6 +115,20 @@ sudo hosting-manager rename example.com example.org --redirect
   (the old files are copied instead of moved); without it the old site is removed
   (`--delete-old-cert` also deletes its certificate)
 
+To switch as soon as DNS is ready, start the rename in the background with `--wait-dns`: it
+checks every 5 minutes (until `--timeout DAYS`, default 14) and renames once every new name
+resolves, to `--expect-ip IP` if given. If the certificate can't be issued, the new site is removed
+again, the old one is left exactly as it was, and it tries again an hour later.
+
+```bash
+sudo systemd-run --unit hm-rename-shop hosting-manager rename shop.example.com shop.example.org --wait-dns --delete-old-cert
+journalctl -u hm-rename-shop -f
+```
+
+`--drop-aliases` leaves the extra names behind; `--rewrite-units` also replaces the host name in
+systemd services (e.g. a server that advertises its own name), but not inside paths such as
+`/var/www/<old>`, and restarts the running services whose command changed.
+
 Update DNS for the new name **before** renaming, so its certificate can be issued. For an HTTPS
 site, `rename` checks that the new names resolve and stops if they don't, so the old name isn't
 removed before the new one has a certificate (`--force` renames anyway and leaves the new name on
@@ -235,7 +249,7 @@ hosting-manager [--dry-run] [-y] <command> [arguments]
 |---|---|
 | `create <domain> [options]` | Add a site (static unless `--php`, `--proxy` or `--redirect-to` is given) |
 | `update <domain> [options]` | Change a site; same options as `create` |
-| `rename <old> <new> [--redirect] [--keep-root] [--delete-old-cert] [--force]` | Move a site to a new domain |
+| `rename <old> <new> [--redirect] [--keep-root] [--delete-old-cert] [--drop-aliases] [--rewrite-units] [--wait-dns [--expect-ip IP] [--timeout DAYS]] [--force]` | Move a site to a new domain |
 | `alias <domain> add\|remove <name>...` | Add or remove extra names |
 | `enable <domain>` / `disable <domain>` | Serve / stop serving a site, keeping its config |
 | `remove <domain> [--purge] [--delete-cert]` | Delete a site (`--purge` also deletes its web root) |

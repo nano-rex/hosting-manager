@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.3.2"
+VERSION="0.4.0"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -728,6 +728,7 @@ issue_cert() {
   else args+=(--register-unsafely-without-email); fi
   (( staging )) && args+=(--staging)
   info "requesting a Let's Encrypt certificate for: $(server_names)"
+  [[ $FAKE == 1 && -n ${HM_FAKE_CERT_FAIL:-} ]] && { warn "(test) certbot failed"; return 1; }
   run certbot certonly --webroot -w "$ACME_ROOT" --cert-name "$DOMAIN" \
     --non-interactive --agree-tos --keep-until-expiring \
     --deploy-hook "systemctl reload $(server_service "$SERVER")" "${args[@]}" || return 1
@@ -1017,14 +1018,20 @@ cmd_remove() {
 
 # rename <old> <new>: move a site to a new domain name
 cmd_rename() {
-  [[ $# -ge 2 ]] || die "usage: $PROG rename <old-domain> <new-domain> [--redirect] [--keep-root] [--delete-old-cert] [--force]"
-  local old=${1,,} new=${2,,} redirect=0 keep_root=0 delcert=0 force=0; shift 2
+  [[ $# -ge 2 ]] || die "usage: $PROG rename <old-domain> <new-domain> [--redirect] [--keep-root] [--delete-old-cert] [--drop-aliases] [--rewrite-units] [--wait-dns [--expect-ip IP] [--timeout DAYS]] [--force]"
+  local args=("$@")
+  local old=${1,,} new=${2,,} redirect=0 keep_root=0 delcert=0 force=0 drop=0 units=0 wait=0 expect="" timeout_days=14; shift 2
   while (($#)); do
     case $1 in
       --redirect) redirect=1 ;;
       --force) force=1 ;;
       --keep-root) keep_root=1 ;;
       --delete-old-cert) delcert=1 ;;
+      --drop-aliases) drop=1 ;;
+      --rewrite-units) units=1 ;;
+      --wait-dns) wait=1 ;;
+      --expect-ip) expect=$2; shift ;;
+      --timeout) timeout_days=$2; shift ;;
       --email) EMAIL=$2; shift ;;
       *) die "unknown option: $1" ;;
     esac; shift
@@ -1035,17 +1042,32 @@ cmd_rename() {
   site_exists "$new" && die "$new already exists"
 
   local old_ssl=$SSL old_root=$ROOT old_aliases=$ALIASES a new_aliases=()
-  for a in $old_aliases; do
-    if [[ $a == "www.$old" ]]; then new_aliases+=("www.$new")
-    elif [[ $a == *".$old" ]]; then new_aliases+=("${a%".$old"}.$new")
-    else new_aliases+=("$a"); fi
-  done
+  if (( ! drop )); then
+    for a in $old_aliases; do
+      if [[ $a == "www.$old" ]]; then new_aliases+=("www.$new")
+      elif [[ $a == *".$old" ]]; then new_aliases+=("${a%".$old"}.$new")
+      else new_aliases+=("$a"); fi
+    done
+  fi
+
+  # --wait-dns: keep the site as it is until every new name resolves (to
+  # --expect-ip when given), then rename; a failed certificate is undone and
+  # tried again an hour later.
+  if (( wait )); then
+    local deadline=$(( $(date +%s) + timeout_days * 86400 )) told=0
+    until names_resolve "$expect" $new ${new_aliases[*]}; do
+      (( $(date +%s) < deadline )) || die "gave up: $new did not resolve within $timeout_days days"
+      (( told )) || { info "waiting for DNS: $new ${new_aliases[*]}${expect:+ -> $expect} (checking every 5 minutes)"; told=1; }
+      sleep "${HM_DNS_POLL:-300}"
+    done
+    info "$new resolves; renaming"
+  fi
 
   # An HTTPS site must not lose its old name before the new one can get a
   # certificate, so the new names have to resolve first.
-  if (( old_ssl && !force )); then
+  if (( old_ssl && !force && !wait )); then
     # shellcheck disable=SC2086
-    check_dns $new ${new_aliases[*]} || die "fix DNS for the new names first (or pass --force to rename anyway and stay on plain HTTP)"
+    check_dns $new ${new_aliases[*]} || die "fix DNS for the new names first (or pass --wait-dns, or --force to rename anyway and stay on plain HTTP)"
   fi
   if [[ $TYPE == custom ]]; then
     BODY_HTTP=$(replace_domain "$BODY_HTTP" "$old" "$new")
@@ -1055,11 +1077,12 @@ cmd_rename() {
   info "renaming $old -> $new"
   # 1. the new site, plain HTTP first so certbot can validate it
   DOMAIN=$new; ALIASES="${new_aliases[*]}"; SSL=0; CERT_FILE=""; CERT_KEY=""
+  local moved_root=""
   if [[ -n $old_root && $old_root == "$WWW/$old" && $keep_root == 0 ]]; then
     ROOT="$WWW/$new"
     if [[ -d $old_root ]]; then
       [[ -e $ROOT ]] && die "$ROOT already exists; use --keep-root or move it away"
-      if (( redirect )); then run cp -a "$old_root" "$ROOT"; else run mv "$old_root" "$ROOT"; fi
+      if (( redirect )); then run cp -a "$old_root" "$ROOT"; else run mv "$old_root" "$ROOT"; moved_root=1; fi
     fi
   fi
   apply_site
@@ -1067,7 +1090,19 @@ cmd_rename() {
 
   if (( old_ssl )); then
     if issue_cert; then SSL=1; apply_site; save_site
-    else warn "$new is on plain HTTP for now; run '$PROG ssl $new' once its DNS points here"; fi
+    elif (( wait || !force )); then
+      # undo: the old site stays exactly as it was
+      unapply_site; delete_site_record "$new"; reload_server "$SERVER"
+      [[ -n $moved_root ]] && run mv "$ROOT" "$old_root"
+      if (( wait )); then
+        warn "no certificate for $new yet (does it point at this server?); trying again in an hour"
+        sleep "${HM_CERT_RETRY:-3600}"
+        exec "$0" rename "${args[@]}"
+      fi
+      die "no certificate for $new; nothing was changed"
+    else
+      warn "$new is on plain HTTP for now; run '$PROG ssl $new' once its DNS points here"
+    fi
   fi
   local new_url
   new_url=$(site_url)
@@ -1087,7 +1122,47 @@ cmd_rename() {
   if (( redirect )) && [[ $old_root == "$WWW/$old" && $keep_root == 0 && -d $old_root ]]; then
     info "the old files are still in $old_root (remove them when you no longer need them)"
   fi
+  (( units )) && rename_in_units "$old" "$new"
   info "done: $new_url"
+}
+
+# names_resolve EXPECTED-IP NAME...: every name has an address (EXPECTED-IP among them, if given)
+names_resolve() {
+  local want=$1 n addrs; shift
+  [[ $FAKE == 1 && -z ${HM_FAKE_DNS:-} ]] && return 0
+  for n in "$@"; do
+    if [[ -n ${HM_FAKE_DNS:-} ]]; then addrs=$(grep -F "$n " "$HM_FAKE_DNS" 2>/dev/null | awk '{print $2}' || true)
+    else addrs=$(getent ahostsv4 "$n" 2>/dev/null | awk '{print $1}' | sort -u || true); fi
+    [[ -n $addrs ]] || return 1
+    [[ -z $want ]] || grep -qxF "$want" <<<"$addrs" || return 1
+  done
+}
+
+# rename_in_units OLD NEW: replace the host name in systemd services (not inside
+# paths such as /var/www/OLD), reload systemd and restart the running services
+# whose command or environment changed.
+rename_in_units() {
+  local old=$1 new=$2 f changed=() keep="$BACKUP_DIR/$STAMP-units"
+  for f in "$ETC"/systemd/system/*.service "$ETC"/systemd/system/*.service.d/*.conf; do
+    [[ -f $f ]] || continue
+    local t; t=$(HM_OLD=$old HM_NEW=$new perl -0777 -pe 's{(?<![A-Za-z0-9./_-])\Q$ENV{HM_OLD}\E(?![A-Za-z0-9-])}{$ENV{HM_NEW}}g' "$f")
+    [[ $t == "$(<"$f")" ]] && continue
+    if (( DRY_RUN )); then echo "${C_DIM}+ rewrite $f${C_RST}"; continue; fi
+    mkdir -p "$keep"; cp -a "$f" "$keep/${f//\//_}"
+    local restart=0
+    diff <(cat "$f") <(printf '%s\n' "$t") | grep -qE '^[<>] *(Exec|Environment|WorkingDirectory)' && restart=1
+    printf '%s\n' "$t" > "$f"
+    local svc=${f##*/}; [[ $f == *.service.d/* ]] && svc=$(basename "$(dirname "$f")" .d)
+    info "updated $svc"
+    (( restart )) && changed+=("$svc")
+  done
+  (( DRY_RUN )) && return 0
+  run systemctl daemon-reload
+  local v
+  for v in "${changed[@]}"; do
+    if [[ $FAKE == 1 ]] || systemctl is-active --quiet "$v"; then run systemctl restart "$v"; info "restarted $v"; fi
+  done
+  return 0
 }
 
 cmd_alias() {
@@ -1796,6 +1871,10 @@ Sites
   update <domain> [options]       change a site (same options as create; --max-body none clears it)
   rename <old> <new>              move a site to a new domain name
       --redirect                  keep <old> as a permanent redirect to <new>
+      --wait-dns                  wait until the new names resolve, then rename (run it in the
+                                  background); --expect-ip IP, --timeout DAYS (default 14)
+      --drop-aliases              don't carry the extra names over
+      --rewrite-units             also replace the host name in systemd services, restart them
       --keep-root                 don't move $WWW/<old> to $WWW/<new>
       --delete-old-cert           delete <old>'s certificate
   alias <domain> add|remove NAME..  add or remove extra names
