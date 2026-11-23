@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1062,9 @@ cmd_rename() {
     done
     info "$new resolves; renaming"
   fi
+  # one change at a time when several renames run side by side
+  take_lock
+  if (( wait )); then load_site "$old"; fi
 
   # An HTTPS site must not lose its old name before the new one can get a
   # certificate, so the new names have to resolve first.
@@ -1096,6 +1099,7 @@ cmd_rename() {
       [[ -n $moved_root ]] && run mv "$ROOT" "$old_root"
       if (( wait )); then
         warn "no certificate for $new yet (does it point at this server?); trying again in an hour"
+        release_lock
         sleep "${HM_CERT_RETRY:-3600}"
         exec "$0" rename "${args[@]}"
       fi
@@ -1125,6 +1129,17 @@ cmd_rename() {
   (( units )) && rename_in_units "$old" "$new"
   info "done: $new_url"
 }
+
+take_lock() {
+  (( DRY_RUN )) && return 0
+  have flock || return 0
+  local f=/run/lock/hosting-manager.lock
+  [[ -n ${HM_ETC:-} ]] && f=$STATE_DIR/.lock
+  mkdir -p "$(dirname "$f")"
+  exec 9>"$f"
+  flock 9
+}
+release_lock() { exec 9>&- 2>/dev/null || true; }
 
 # names_resolve EXPECTED-IP NAME...: every name has an address (EXPECTED-IP among them, if given)
 names_resolve() {
