@@ -97,8 +97,12 @@ ServerTokens Prod
 </VirtualHost>
 CONF
 cert app.legacy.test
+# a copy of the certbot pair under another name, for the rename test
+sed 's/app\.legacy\.test/pay.legacy.test/g; s/5000/5002/' "$T/etc/apache2/sites-available/app.conf" > "$T/etc/apache2/sites-available/pay.conf"
+sed 's/app\.legacy\.test/pay.legacy.test/g; s/5000/5002/' "$T/etc/apache2/sites-available/app-le-ssl.conf" > "$T/etc/apache2/sites-available/pay-le-ssl.conf"
+cert pay.legacy.test; cert pay.newname.test
 chmod 640 "$T/etc/apache2/sites-available/legacy.conf"
-for f in legacy app app-le-ssl; do ln -s ../sites-available/$f.conf "$T/etc/apache2/sites-enabled/$f.conf"; done
+for f in legacy app app-le-ssl pay pay-le-ssl; do ln -s ../sites-available/$f.conf "$T/etc/apache2/sites-enabled/$f.conf"; done
 for f in hidden mixed; do ln -s ../conf-available/$f.conf "$T/etc/apache2/conf-enabled/$f.conf"; done
 mkdir -p "$T/home/legacy/public_html/shop" "$T/home/legacy/public_html/blog"
 echo '<?php define("ROOT", "'"$T"'/home/legacy/public_html/shop/inc");' > "$T/home/legacy/public_html/shop/config.php"
@@ -106,7 +110,11 @@ hm adopt --all
 # point the adopted sites at the sandbox copy of /home, then relocate it
 hm update shop.legacy.test --root "$T/home/legacy/public_html/shop"
 hm update blog.legacy.test --root "$T/home/legacy/public_html/blog"
-hm -y relocate "$T/home/legacy" "$T/www/legacy" --fix-app-paths
+mkdir -p "$T/etc/systemd/system" "$T/home/legacy/api"
+printf '[Service]\nWorkingDirectory=%s/home/legacy/api\nExecStart=/usr/bin/dotnet %s/home/legacy/api/API.dll\n' "$T" "$T" > "$T/etc/systemd/system/legacy-api.service"
+hm -y relocate "$T/home/legacy" "$T/www/legacy" --fix-app-paths --rewrite-units
+# rename an adopted HTTPS site whose directives mention its own name
+hm rename pay.legacy.test pay.newname.test --force
 
 n=$T/etc/nginx; a=$T/etc/apache2
 check "nginx static site enabled"        "[[ -L $n/sites-enabled/static.test.conf ]]"
@@ -126,7 +134,7 @@ check "apache php handler"               "grep -q 'proxy:unix:/run/php/php-fpm.s
 check "apache https upstream"            "grep -q 'SSLProxyEngine on' $a/sites-available/a-proxy.test.conf"
 check "apache upload limit"              "grep -q 'LimitRequestBody 10485760' $a/sites-available/a-plain.test.conf"
 check "apache rename without redirect"   "[[ ! -e $a/sites-available/a-old.test.conf && -f $a/sites-available/a-new.test.conf ]]"
-check "list shows 16 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 16 ]]"
+check "list shows 17 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 17 ]]"
 check "adopt: one file per site"         "[[ -f $a/sites-available/shop.legacy.test.conf && -f $a/sites-available/blog.legacy.test.conf ]]"
 check "adopt: port and directives kept"  "grep -q '<VirtualHost \*:3000>' $a/sites-available/shop.legacy.test.conf && grep -q 'php_admin_value open_basedir' $a/sites-available/shop.legacy.test.conf"
 check "adopt: aliases kept"              "grep -q 'ServerAlias www.shop.legacy.test' $a/sites-available/shop.legacy.test.conf"
@@ -141,6 +149,9 @@ check "relocate: files copied"           "[[ -f $T/www/legacy/public_html/shop/c
 check "relocate: sites switched"         "grep -q 'DocumentRoot $T/www/legacy/public_html/shop' $a/sites-available/shop.legacy.test.conf && ! grep -q '$T/home/legacy' $a/sites-available/shop.legacy.test.conf"
 check "relocate: open_basedir switched"  "grep -q 'open_basedir \"$T/www/legacy/public_html/shop/:' $a/sites-available/shop.legacy.test.conf"
 check "relocate: app path fixed"         "grep -q '$T/www/legacy/public_html/shop/inc' $T/www/legacy/public_html/shop/config.php"
+check "relocate: service rewritten"     "grep -q 'WorkingDirectory=$T/www/legacy/api' $T/etc/systemd/system/legacy-api.service && ! grep -q '$T/home/legacy' $T/etc/systemd/system/legacy-api.service"
+check "rename adopted: names in body"    "grep -q 'RewriteCond %{SERVER_NAME} =pay.newname.test' $a/sites-available/pay.newname.test.conf && grep -q 'ServerAlias www.pay.newname.test' $a/sites-available/pay.newname.test.conf"
+check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
 check "relocate: old copy kept"          "[[ -f $T/home/legacy/public_html/shop/config.php ]]"
 
 NGINX=$(command -v nginx || ls /usr/sbin/nginx 2>/dev/null || true)

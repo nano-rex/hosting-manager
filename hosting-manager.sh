@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -928,6 +928,12 @@ replace_path() {
   printf '%s' "$1" | HM_OLD=$old HM_NEW=$new perl -0777 -pe 's{\Q$ENV{HM_OLD}\E(?=[/"\x27 :;>]|$)}{$ENV{HM_NEW}}gm'
 }
 
+# replace_domain TEXT OLD NEW: replace the host name OLD (also as the end of a
+# longer name like www.OLD), but not inside other names such as my-OLD.
+replace_domain() {
+  printf '%s' "$1" | HM_OLD=$2 HM_NEW=$3 perl -0777 -pe 's{(?<![A-Za-z0-9-])\Q$ENV{HM_OLD}\E(?![A-Za-z0-9-])}{$ENV{HM_NEW}}g'
+}
+
 words_without() {
   local w out=()
   for w in $1; do [[ $w == "$2" ]] || out+=("$w"); done
@@ -1011,11 +1017,12 @@ cmd_remove() {
 
 # rename <old> <new>: move a site to a new domain name
 cmd_rename() {
-  [[ $# -ge 2 ]] || die "usage: $PROG rename <old-domain> <new-domain> [--redirect] [--keep-root] [--delete-old-cert]"
-  local old=${1,,} new=${2,,} redirect=0 keep_root=0 delcert=0; shift 2
+  [[ $# -ge 2 ]] || die "usage: $PROG rename <old-domain> <new-domain> [--redirect] [--keep-root] [--delete-old-cert] [--force]"
+  local old=${1,,} new=${2,,} redirect=0 keep_root=0 delcert=0 force=0; shift 2
   while (($#)); do
     case $1 in
       --redirect) redirect=1 ;;
+      --force) force=1 ;;
       --keep-root) keep_root=1 ;;
       --delete-old-cert) delcert=1 ;;
       --email) EMAIL=$2; shift ;;
@@ -1033,6 +1040,17 @@ cmd_rename() {
     elif [[ $a == *".$old" ]]; then new_aliases+=("${a%".$old"}.$new")
     else new_aliases+=("$a"); fi
   done
+
+  # An HTTPS site must not lose its old name before the new one can get a
+  # certificate, so the new names have to resolve first.
+  if (( old_ssl && !force )); then
+    # shellcheck disable=SC2086
+    check_dns $new ${new_aliases[*]} || die "fix DNS for the new names first (or pass --force to rename anyway and stay on plain HTTP)"
+  fi
+  if [[ $TYPE == custom ]]; then
+    BODY_HTTP=$(replace_domain "$BODY_HTTP" "$old" "$new")
+    BODY_HTTPS=$(replace_domain "$BODY_HTTPS" "$old" "$new")
+  fi
 
   info "renaming $old -> $new"
   # 1. the new site, plain HTTP first so certbot can validate it
@@ -1603,10 +1621,11 @@ app_files_with() {   # app_files_with DIR PREFIX
 }
 
 cmd_relocate() {
-  [[ $# -ge 2 ]] || die "usage: $PROG relocate <old-dir> <new-dir> [--fix-app-paths] [--rewrite-confs] [--delete-old]"
-  local old=${1%/} new=${2%/} fix=0 confs=0 del=0; shift 2
+  [[ $# -ge 2 ]] || die "usage: $PROG relocate <old-dir> <new-dir> [--fix-app-paths] [--rewrite-confs] [--rewrite-units] [--delete-old]"
+  local old=${1%/} new=${2%/} fix=0 confs=0 units=0 del=0; shift 2
   while (($#)); do
     case $1 in
+      --rewrite-units) units=1 ;;
       --fix-app-paths) fix=1 ;;
       --rewrite-confs) confs=1 ;;
       --delete-old) del=1 ;;
@@ -1636,6 +1655,13 @@ cmd_relocate() {
   if (( ${#others[@]} )); then
     if (( confs )); then echo "other Apache files to update:"; else echo "other Apache files that mention it (not changed; add --rewrite-confs):"; fi
     printf '  %s\n' "${others[@]}"
+  fi
+  local unit_files=() u
+  mapfile -t unit_files < <(grep -lF "$old" "$ETC"/systemd/system/*.service "$ETC"/systemd/system/*.service.d/*.conf 2>/dev/null || true)
+  if (( ${#unit_files[@]} )); then
+    if (( units )); then echo "services that run from it (rewritten and restarted):"
+    else echo "services that run from it (not changed; add --rewrite-units):"; fi
+    printf '  %s\n' "${unit_files[@]}"
   fi
   local apps; apps=$(app_files_with "$old" "$old")
   if [[ -n $apps ]]; then
@@ -1673,7 +1699,20 @@ cmd_relocate() {
   fi
 
   backup_tree relocate
-  fail_back() { restore_tree; rm -rf -- "$new"; die "$1; everything was put back and $new removed"; }
+  local unit_keep="$BACKUP_DIR/$STAMP-units" services=()
+  for u in "${unit_files[@]}"; do
+    local svc=${u##*/}; [[ $u == *.service.d/* ]] && svc=$(basename "$(dirname "$u")" .d)
+    [[ " ${services[*]} " == *" $svc "* ]] || services+=("$svc")
+  done
+  restore_units() {
+    (( units )) || return 0
+    local f
+    for f in "${unit_files[@]}"; do [[ -f $unit_keep/${f//\//_} ]] && cp -a "$unit_keep/${f//\//_}" "$f"; done
+    if (( ${#unit_files[@]} )) && [[ $FAKE != 1 ]]; then
+      systemctl daemon-reload; local v; for v in "${services[@]}"; do systemctl restart "$v" || true; done
+    fi
+  }
+  fail_back() { restore_tree; restore_units; rm -rf -- "$new"; die "$1; everything was put back and $new removed"; }
   BATCH=1
   for d in "${sites[@]}"; do
     load_site "$d"
@@ -1694,6 +1733,24 @@ cmd_relocate() {
   local out
   out=$(config_test apache) || { printf '%s\n' "$out" >&2; fail_back "configuration test failed"; }
   reload_server apache
+  if (( units && ${#unit_files[@]} )); then
+    mkdir -p "$unit_keep"
+    for u in "${unit_files[@]}"; do
+      cp -a "$u" "$unit_keep/${u//\//_}"
+      local t; t=$(replace_path "$(<"$u")" "$old" "$new")
+      printf '%s\n' "$t" > "$u"
+    done
+    run systemctl daemon-reload
+    local v
+    for v in "${services[@]}"; do
+      run systemctl restart "$v" || fail_back "$v did not restart"
+    done
+    sleep 3
+    if [[ $FAKE != 1 ]]; then
+      for v in "${services[@]}"; do systemctl is-active --quiet "$v" || fail_back "$v is not running after the move"; done
+    fi
+    info "services moved: ${services[*]}"
+  fi
   sleep 2
   local after; after=$(for d in "${sites[@]}"; do ( load_site "$d"; (( ENABLED )) && site_urls; true ); done | probe_urls)
   compare_probes "$before" "$after" || fail_back "some sites answered differently"
@@ -1739,6 +1796,7 @@ Sites
   relocate <old-dir> <new-dir>    copy web files elsewhere and switch every site using them
       --fix-app-paths             also rewrite the path inside app files (.php, .ini, .env, ...)
       --rewrite-confs             also rewrite other Apache files that mention it
+      --rewrite-units             also rewrite systemd services that run from it, and restart them
       --delete-old                delete <old-dir> after a successful switch
   check [--save F] [--compare F]  how each site answers (status, redirect), or compare with F
   default <domain>                the site that answers names no other site claims

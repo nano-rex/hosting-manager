@@ -115,7 +115,11 @@ sudo hosting-manager rename example.com example.org --redirect
   (the old files are copied instead of moved); without it the old site is removed
   (`--delete-old-cert` also deletes its certificate)
 
-Update DNS for the new name **before** renaming, so its certificate can be issued.
+Update DNS for the new name **before** renaming, so its certificate can be issued. For an HTTPS
+site, `rename` checks that the new names resolve and stops if they don't, so the old name isn't
+removed before the new one has a certificate (`--force` renames anyway and leaves the new name on
+plain HTTP until `hosting-manager ssl <new>` succeeds). For adopted sites the old name is also
+replaced inside their own directives (redirect targets, certbot's `RewriteCond %{SERVER_NAME}`).
 
 ### Add or remove extra names
 
@@ -198,6 +202,9 @@ sudo hosting-manager relocate /home/olduser/public_html /var/www/olduser/public_
   `.user.ini`, `.htaccess`, `.env`, `.json`, `.yml`, `.xml`, ...; `uploads/` and `cache/` are skipped).
   The originals are kept in `/etc/hosting-manager/backups/<time>-app-files/`.
 - `--rewrite-confs` also updates other Apache files that mention the folder (shown in the dry run).
+- `--rewrite-units` also updates systemd services that run from the folder (`WorkingDirectory`,
+  `ExecStart`, ...), reloads systemd and restarts them; if one doesn't come back up, everything
+  is put back.
 - If the configuration test fails or a site answers differently, the configs are restored and the
   copy is removed. The old folder is kept until you delete it (or pass `--delete-old`).
 
@@ -228,7 +235,7 @@ hosting-manager [--dry-run] [-y] <command> [arguments]
 |---|---|
 | `create <domain> [options]` | Add a site (static unless `--php`, `--proxy` or `--redirect-to` is given) |
 | `update <domain> [options]` | Change a site; same options as `create` |
-| `rename <old> <new> [--redirect] [--keep-root] [--delete-old-cert]` | Move a site to a new domain |
+| `rename <old> <new> [--redirect] [--keep-root] [--delete-old-cert] [--force]` | Move a site to a new domain |
 | `alias <domain> add\|remove <name>...` | Add or remove extra names |
 | `enable <domain>` / `disable <domain>` | Serve / stop serving a site, keeping its config |
 | `remove <domain> [--purge] [--delete-cert]` | Delete a site (`--purge` also deletes its web root) |
@@ -236,7 +243,7 @@ hosting-manager [--dry-run] [-y] <command> [arguments]
 | `info <domain>` | Settings, config file path, certificate expiry |
 | `show <domain>` | Print the generated nginx/Apache config |
 | `adopt --all \| <domain>...` | Take over existing Apache sites: one file per site (Apache only) |
-| `relocate <old-dir> <new-dir> [--fix-app-paths] [--rewrite-confs] [--delete-old]` | Copy web files elsewhere and switch the sites using them |
+| `relocate <old-dir> <new-dir> [--fix-app-paths] [--rewrite-confs] [--rewrite-units] [--delete-old]` | Copy web files elsewhere and switch the sites using them |
 | `check [--save FILE] [--compare FILE] [<domain>...]` | Status and redirect of each site, or compare with a saved run |
 | `default <domain>` | The site that answers names no other site claims |
 | `ssl <domain> [--staging] [--email ADDR]` | Get a certificate and enable HTTPS |
