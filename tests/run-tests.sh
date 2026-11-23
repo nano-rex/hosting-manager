@@ -152,6 +152,7 @@ check "relocate: app path fixed"         "grep -q '$T/www/legacy/public_html/sho
 check "relocate: service rewritten"     "grep -q 'WorkingDirectory=$T/www/legacy/api' $T/etc/systemd/system/legacy-api.service && ! grep -q '$T/home/legacy' $T/etc/systemd/system/legacy-api.service"
 check "rename adopted: names in body"    "grep -q 'RewriteCond %{SERVER_NAME} =pay.newname.test' $a/sites-available/pay.newname.test.conf && grep -q 'ServerAlias www.pay.newname.test' $a/sites-available/pay.newname.test.conf"
 check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
+check "check is its own command"         "bash $HM check >/dev/null 2>&1 && ! bash $HM check | grep -q '^hosting-manager '"
 check "relocate: old copy kept"          "[[ -f $T/home/legacy/public_html/shop/config.php ]]"
 
 NGINX=$(command -v nginx || ls /usr/sbin/nginx 2>/dev/null || true)

@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -1875,7 +1875,7 @@ main() {
     renew) cmd_renew "$@" ;;
     certs|certificates) cmd_certs ;;
     install) cmd_install "$@" ;;
-    doctor|check) cmd_doctor ;;
+    doctor) cmd_doctor ;;
     test) cmd_test ;;
     reload) cmd_reload ;;
     config) cmd_config "$@" ;;
