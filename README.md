@@ -7,7 +7,10 @@ moves a site to a new domain, or adds a `www.` name.
 - Static sites, PHP sites (php-fpm), reverse proxies to an app (Node, Python, Docker…) and redirects
 - HTTPS with Let's Encrypt, including automatic renewal
 - Rename a site to a new domain, optionally keeping the old one as a redirect
-- Works with nginx and Apache, on Debian/Ubuntu and RHEL/Fedora/Rocky style layouts
+- Works with nginx and Apache, on Debian/Ubuntu, RHEL/Fedora/Rocky, Arch, Alpine, Void,
+  openSUSE and Gentoo style layouts
+- Works with any common init system: systemd, OpenRC, runit, s6 (plain or s6-rc), dinit and
+  SysV init (see [Init systems](#init-systems))
 - Every change is checked with `nginx -t` / `apachectl configtest` first; if the check fails,
   the previous config is put back and nothing is reloaded
 - `--dry-run` shows exactly what would be written and run
@@ -29,8 +32,9 @@ sudo install -m 755 hosting-manager.sh /usr/local/bin/hosting-manager
 
 ### 2. Install a web server and certbot
 
-If they aren't installed yet, hosting-manager can do it (apt, dnf, yum or pacman). It also
-starts the services and opens ports 80/443 if `ufw` is active:
+If they aren't installed yet, hosting-manager can do it (apt, dnf, yum, pacman, apk, xbps,
+zypper or emerge). It also enables and starts the services with your init system and opens
+ports 80/443 if `ufw` is active:
 
 ```bash
 sudo hosting-manager install nginx certbot        # or: apache certbot
@@ -123,10 +127,13 @@ again, the old one is left exactly as it was, and it tries again an hour later.
 ```bash
 sudo systemd-run --unit hm-rename-shop hosting-manager rename shop.example.com shop.example.org --wait-dns --delete-old-cert
 journalctl -u hm-rename-shop -f
+# without systemd:
+sudo nohup hosting-manager rename shop.example.com shop.example.org --wait-dns > /var/log/hm-rename-shop.log 2>&1 &
 ```
 
 `--drop-aliases` leaves the extra names behind; `--rewrite-units` also replaces the host name in
-systemd services (e.g. a server that advertises its own name), but not inside paths such as
+service definitions (e.g. a server that advertises its own name; see [Init systems](#init-systems)),
+but not inside paths such as
 `/var/www/<old>`, and restarts the running services whose command changed.
 
 Update DNS for the new name **before** renaming, so its certificate can be issued. For an HTTPS
@@ -228,9 +235,9 @@ sudo hosting-manager relocate /home/olduser/public_html /var/www/olduser/public_
   `.user.ini`, `.htaccess`, `.env`, `.json`, `.yml`, `.xml`, ...; `uploads/` and `cache/` are skipped).
   The originals are kept in `/etc/hosting-manager/backups/<time>-app-files/`.
 - `--rewrite-confs` also updates other Apache files that mention the folder (shown in the dry run).
-- `--rewrite-units` also updates systemd services that run from the folder (`WorkingDirectory`,
-  `ExecStart`, ...), reloads systemd and restarts them; if one doesn't come back up, everything
-  is put back.
+- `--rewrite-units` also updates the services that run from the folder (systemd
+  `WorkingDirectory`/`ExecStart`, OpenRC and runit scripts, ...; see [Init systems](#init-systems))
+  and restarts them; if one doesn't come back up, everything is put back.
 - If the configuration test fails or a site answers differently, the configs are restored and the
   copy is removed. The old folder is kept until you delete it (or pass `--delete-old`).
 
@@ -313,16 +320,42 @@ local resolver or router still remembers the old answer; needs `dig`).
 | `/etc/nginx/sites-available/<domain>.conf` (+ link in `sites-enabled`) | nginx site on Debian/Ubuntu |
 | `/etc/nginx/conf.d/<domain>.conf` | nginx site on RHEL-style systems (`.conf.disabled` when disabled) |
 | `/etc/apache2/sites-available/<domain>.conf` | Apache site on Debian/Ubuntu |
-| `/etc/httpd/conf.d/<domain>.conf` | Apache site on RHEL-style systems |
+| `/etc/nginx/http.d/<domain>.conf` | nginx site on Alpine |
+| `/etc/httpd/conf.d/<domain>.conf` | Apache site on RHEL/Fedora/Arch |
+| `/etc/apache2/conf.d/`, `/etc/apache2/vhosts.d/`, `/etc/apache/conf.d/` | Apache site on Alpine, Gentoo, Void |
 | `/etc/hosting-manager/sites/<domain>.site` | hosting-manager's record of each site |
 | `/etc/hosting-manager/sites/<domain>.http`, `.https` | the kept directives of an adopted site |
 | `/etc/hosting-manager/backups/<time>/` | copies of every file before it was changed |
 | `/etc/hosting-manager/hosting-manager.conf` | defaults set with `config` |
 | `/var/www/_letsencrypt` | shared folder for certificate validation |
 
+If the main `nginx.conf` / `httpd.conf` doesn't read the drop-in folder yet (stock configs on
+Void and Arch), hosting-manager adds one `include` line to it, after backing it up.
+
 Generated configs are regenerated from the site record on every change, so make changes
 with hosting-manager rather than editing them by hand. Sites you configured yourself are left
 alone until you `adopt` them; hosting-manager only touches the sites it manages.
+
+## Init systems
+
+hosting-manager finds the init system from process 1 (override with `HM_INIT=systemd|openrc|
+runit|s6|dinit|sysv`; `hosting-manager doctor` shows what it found) and uses it to reload the
+web server, to enable and start services in `install`, for certbot's renewal hook, and to
+restart the services `--rewrite-units` changes:
+
+| Init | Reload web server | Restart a service | Enable at boot | Service files `--rewrite-units` edits |
+|---|---|---|---|---|
+| systemd | `systemctl reload` | `systemctl restart` | `systemctl enable --now` | `/etc/systemd/system/*.service`, `*.service.d/*.conf` |
+| OpenRC | `rc-service X reload` | `rc-service X restart` | `rc-update add X default` | `/etc/init.d/*`, `/etc/conf.d/*` |
+| SysV init | `service X reload` | `service X restart` | `update-rc.d` / `chkconfig` | `/etc/init.d/*`, `/etc/default/*` |
+| runit | `sv hup` (nginx), `sv 1` (Apache graceful) | `sv restart` | link `/etc/sv/X` (or `/etc/runit/sv/X`) into the service dir | `run`, `conf`, `env/*` of each service |
+| s6 / s6-rc | `s6-svc -h` (nginx), `s6-svc -1` (Apache) | `s6-svc -r` | `s6-service add default X` (Artix), s6-rc or a scandir link | `run`/`up` in `/etc/s6/sv`, `/etc/s6-rc/source`, `/etc/s6-overlay/s6-rc.d`, `/etc/services.d`; `/etc/s6/config/*.conf` |
+| dinit | `dinitctl signal HUP/USR1` | `dinitctl restart` | `dinitctl enable` | `/etc/dinit.d/*` |
+
+runit's service dir is found at `/run/runit/service` (Artix), `/var/service` (Void) or
+`/etc/service`; s6's scan dir at `/run/service` or `/var/run/s6/services` (`HM_RUNIT_DIR` and
+`HM_S6_SCANDIR` override them). With systemd, only `Exec*`/`Environment`/`WorkingDirectory`
+changes trigger a restart; with script-based inits any change does.
 
 ## Testing
 
@@ -333,6 +366,14 @@ it also runs `nginx -t` and `apache2 -t` on the generated configs.
 
 ```bash
 bash tests/run-tests.sh
+```
+
+The sandbox also covers every init system's commands and service files. To run it for real,
+`tests/init-systems.sh` (needs Docker) installs nginx, creates a site and adds an alias inside
+throwaway Alpine (OpenRC and s6), Debian (SysV init) and Void (runit) containers:
+
+```bash
+sudo bash tests/init-systems.sh            # or: ... openrc runit
 ```
 
 ## License

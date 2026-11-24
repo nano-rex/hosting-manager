@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.4.4"
+VERSION="0.5.0"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -117,17 +117,82 @@ is_apex() { [[ $1 =~ ^[^.]+\.[^.]+$ ]]; }
 # ---------------------------------------------------------------------------
 nginx_layout() {
   if [[ -d $ETC/nginx/sites-available ]]; then echo debian
-  elif [[ -d $ETC/nginx/conf.d ]]; then echo confd
+  elif [[ -n $(nginx_confd) ]]; then echo confd
   else echo none; fi
+}
+
+# nginx's drop-in folder: conf.d on most systems, http.d on Alpine
+nginx_confd() {
+  local d
+  for d in conf.d http.d; do [[ -d $ETC/nginx/$d ]] && { echo "$ETC/nginx/$d"; return; }; done
+  [[ -d $ETC/nginx ]] && echo "$ETC/nginx/conf.d"
+  return 0
 }
 
 apache_layout() {
-  if [[ -d $ETC/apache2 ]]; then echo debian
-  elif [[ -d $ETC/httpd ]]; then echo confd
+  if [[ -d $ETC/apache2/sites-available ]]; then echo debian
+  elif [[ -n $(apache_confd) ]]; then echo confd
   else echo none; fi
 }
 
-apache_service() { [[ $(apache_layout) == confd ]] && echo httpd || echo apache2; }
+# Apache's main folder and drop-in folder on conf.d-style systems:
+# /etc/httpd (Fedora/RHEL/Arch), /etc/apache2 (Alpine, Gentoo's vhosts.d), /etc/apache (Void)
+apache_confd() {
+  local d
+  for d in httpd/conf.d apache2/conf.d apache2/vhosts.d apache/conf.d; do
+    [[ -d $ETC/$d ]] && { echo "$ETC/$d"; return; }
+  done
+  # no drop-in folder yet (Arch, Void): use one next to the main config
+  [[ -f $ETC/httpd/conf/httpd.conf ]] && { echo "$ETC/httpd/conf.d"; return; }
+  [[ -f $ETC/apache/httpd.conf ]] && { echo "$ETC/apache/conf.d"; return; }
+  return 0
+}
+
+apache_main_conf() {
+  local f
+  for f in httpd/conf/httpd.conf apache2/httpd.conf apache/httpd.conf; do
+    [[ -f $ETC/$f ]] && { echo "$ETC/$f"; return; }
+  done
+  return 0
+}
+
+# ensure_include SERVER: on conf.d-style systems, make sure the main config
+# reads the drop-in folder (stock configs on Void and Arch don't), creating
+# the folder and adding the include line once.
+ensure_include() {
+  (( DRY_RUN )) && return 0
+  local dir main base
+  if [[ $1 == nginx ]]; then
+    [[ $(nginx_layout) == confd ]] || return 0
+    dir=$(nginx_confd); main=$ETC/nginx/nginx.conf
+  else
+    [[ $(apache_layout) == confd ]] || return 0
+    dir=$(apache_confd); main=$(apache_main_conf)
+  fi
+  [[ -n $dir && -f $main ]] || return 0
+  mkdir -p "$dir"
+  base=${dir##*/}
+  if [[ $1 == nginx ]]; then
+    grep -qE "^[[:space:]]*include[[:space:]]+[^;#]*$base/\*" "$main" && return 0
+    grep -qE '^[[:space:]]*http[[:space:]]*\{' "$main" || { warn "$main has no http { } block; include $dir/*.conf yourself"; return 0; }
+    backup_file "$main"
+    HM_INC="    include $dir/*.conf;   # added by hosting-manager" perl -0pi -e 's{^([ \t]*http[ \t]*\{[^\n]*\n)}{$1$ENV{HM_INC}\n}m' "$main"
+  else
+    grep -qiE "^[[:space:]]*Include(Optional)?[[:space:]]+\"?[^#]*$base/" "$main" && return 0
+    backup_file "$main"
+    printf '\n# added by hosting-manager\nIncludeOptional %s/*.conf\n' "$dir" >> "$main"
+  fi
+  info "$main now reads $dir/*.conf"
+}
+
+apache_service() {
+  if [[ $(apache_layout) == debian ]]; then echo apache2; return; fi
+  case $(apache_confd) in
+    "$ETC"/httpd/*) echo httpd ;;
+    "$ETC"/apache/*) echo apache ;;
+    *) echo apache2 ;;
+  esac
+}
 
 server_service() {
   case $1 in
@@ -166,10 +231,10 @@ conf_path() {
   case $server in
     nginx)
       if [[ $(nginx_layout) == debian ]]; then echo "$ETC/nginx/sites-available/$domain.conf"
-      else echo "$ETC/nginx/conf.d/$domain.conf"; fi ;;
+      else echo "$(nginx_confd)/$domain.conf"; fi ;;
     apache)
       if [[ $(apache_layout) == debian ]]; then echo "$ETC/apache2/sites-available/$domain.conf"
-      else echo "$ETC/httpd/conf.d/$domain.conf"; fi ;;
+      else echo "$(apache_confd)/$domain.conf"; fi ;;
   esac
 }
 
@@ -425,7 +490,7 @@ EOF
 
 # nginx needs a map at http{} level for websocket upgrades in proxy sites.
 ensure_nginx_globals() {
-  local f="$ETC/nginx/conf.d/hosting-manager.conf"
+  local f; f="$(nginx_confd)/hosting-manager.conf"
   [[ -f $f ]] && return 0
   write_file "$f" "# Created by $PROG; shared by its proxy sites.
 map \$http_upgrade \$hm_connection_upgrade {
@@ -608,14 +673,209 @@ config_test() {
   esac
 }
 
-reload_server() {
-  local svc
-  svc=$(server_service "$1")
-  if have systemctl && [[ -d /run/systemd/system ]]; then
-    run systemctl reload "$svc" || run systemctl restart "$svc"
-  else
-    run service "$svc" reload
+# ---------------------------------------------------------------------------
+# Init systems: systemd, OpenRC, runit, s6 (plain or s6-rc), dinit, SysV init.
+# Everything that starts, stops or rewrites a service goes through svc_*.
+# ---------------------------------------------------------------------------
+INIT_SYSTEM="${HM_INIT:-}"
+
+init_system() {
+  if [[ -z $INIT_SYSTEM ]]; then
+    local pid1=""; pid1=$(cat /proc/1/comm 2>/dev/null || true)
+    case $pid1 in
+      systemd) INIT_SYSTEM=systemd ;;
+      runit|runit-init) INIT_SYSTEM=runit ;;
+      s6-svscan|s6-linux-init*) INIT_SYSTEM=s6 ;;
+      dinit) INIT_SYSTEM=dinit ;;
+      openrc-init) INIT_SYSTEM=openrc ;;
+      *)
+        if [[ -d /run/systemd/system ]] && have systemctl; then INIT_SYSTEM=systemd
+        elif have rc-service && [[ -d /run/openrc ]]; then INIT_SYSTEM=openrc
+        elif have sv && [[ -n $(runit_dir) ]] && pgrep -x runsvdir >/dev/null 2>&1; then INIT_SYSTEM=runit
+        elif have s6-svc && [[ -n $(s6_scandir) ]]; then INIT_SYSTEM=s6
+        elif have dinitctl && pgrep -x dinit >/dev/null 2>&1; then INIT_SYSTEM=dinit
+        elif [[ -d /etc/init.d ]]; then INIT_SYSTEM=sysv
+        else INIT_SYSTEM=none; fi ;;
+    esac
   fi
+  echo "$INIT_SYSTEM"
+}
+
+# runit's folder of running services: Void /var/service, Artix /run/runit/service,
+# Debian/Devuan /etc/service
+runit_dir() {
+  local d
+  for d in ${HM_RUNIT_DIR:-} /run/runit/service /var/service /etc/service /service; do
+    [[ -d $d ]] && { echo "$d"; return; }
+  done
+  return 0
+}
+# where runit service definitions live (linked into runit_dir to enable them)
+runit_sources() { local d; for d in "$ETC/sv" "$ETC/runit/sv"; do [[ -d $d ]] && echo "$d"; done; return 0; }
+
+# s6's scan directory (s6-linux-init and s6-overlay v3: /run/service)
+s6_scandir() {
+  local d
+  for d in ${HM_S6_SCANDIR:-} /run/service /var/run/s6/services /service; do
+    [[ -d $d ]] && { echo "$d"; return; }
+  done
+  return 0
+}
+s6_sources() {
+  local d
+  for d in "$ETC/s6/sv" "$ETC/s6-rc/source" "$ETC/s6-overlay/s6-rc.d" "$ETC/services.d"; do [[ -d $d ]] && echo "$d"; done
+  return 0
+}
+
+# svc_names: every service this init system knows about
+svc_names() {
+  local d f
+  case $(init_system) in
+    systemd) systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{sub(/\.service$/, "", $1); print $1}' ;;
+    openrc|sysv) for f in "$ETC"/init.d/*; do [[ -f $f && -x $f ]] && echo "${f##*/}"; done ;;
+    runit) for d in $(runit_sources) "$(runit_dir)"; do for f in "$d"/*/; do [[ -d $f ]] && basename "$f"; done; done ;;
+    s6) for d in $(s6_sources) "$(s6_scandir)"; do for f in "$d"/*/; do [[ -d $f ]] && basename "$f"; done; done ;;
+    dinit) for f in "$ETC"/dinit.d/*; do [[ -f $f ]] && echo "${f##*/}"; done ;;
+  esac 2>/dev/null | sort -u
+  return 0
+}
+
+svc_active() {
+  local n=$1
+  [[ $FAKE == 1 ]] && return 0
+  case $(init_system) in
+    systemd) systemctl is-active --quiet "$n" ;;
+    openrc) rc-service "$n" status >/dev/null 2>&1 ;;
+    runit) sv status "$(runit_dir)/$n" 2>/dev/null | grep -q '^run:' ;;
+    s6) [[ $(s6-svstat -o up "$(s6_scandir)/$n" 2>/dev/null) == true ]] ;;
+    dinit) dinitctl status "$n" 2>/dev/null | grep -qi 'state: *started' ;;
+    sysv) if have service; then service "$n" status >/dev/null 2>&1; else "$ETC/init.d/$n" status >/dev/null 2>&1; fi ;;
+    *) return 1 ;;
+  esac
+}
+
+svc_restart() {
+  local n=$1
+  case $(init_system) in
+    systemd) run systemctl restart "$n" ;;
+    openrc) run rc-service "$n" restart ;;
+    runit) run sv restart "$(runit_dir)/$n" ;;
+    s6) run s6-svc -r "$(s6_scandir)/$n" ;;
+    dinit) run dinitctl restart "$n" ;;
+    sysv) if have service; then run service "$n" restart; else run "$ETC/init.d/$n" restart; fi ;;
+    *) die "no init system found to restart $n; restart it yourself" ;;
+  esac
+}
+
+# svc_reload NAME SIGNAL: reload a daemon's configuration. Supervisors that
+# can't "reload" (runit, s6, dinit) get SIGNAL instead: HUP for nginx, USR1
+# (graceful restart) for Apache.
+svc_reload() {
+  local n=$1 sig=${2:-HUP}
+  case $(init_system) in
+    systemd) run systemctl reload "$n" || run systemctl restart "$n" ;;
+    openrc) run rc-service "$n" reload || run rc-service "$n" restart ;;
+    runit) if [[ $sig == USR1 ]]; then run sv 1 "$(runit_dir)/$n"; else run sv hup "$(runit_dir)/$n"; fi ;;
+    s6) if [[ $sig == USR1 ]]; then run s6-svc -1 "$(s6_scandir)/$n"; else run s6-svc -h "$(s6_scandir)/$n"; fi ;;
+    dinit) run dinitctl signal "$sig" "$n" 2>/dev/null || run dinitctl restart "$n" ;;
+    sysv) if have service; then run service "$n" reload || run service "$n" restart
+          else run "$ETC/init.d/$n" reload || run "$ETC/init.d/$n" restart; fi ;;
+    *) die "no init system found to reload $n; reload it yourself" ;;
+  esac
+}
+
+# The same reload as a command line, for certbot's --deploy-hook.
+svc_reload_cmd() {
+  local n=$1 sig=${2:-HUP}
+  case $(init_system) in
+    systemd) echo "systemctl reload $n" ;;
+    openrc) echo "rc-service $n reload" ;;
+    runit) [[ $sig == USR1 ]] && echo "sv 1 $(runit_dir)/$n" || echo "sv hup $(runit_dir)/$n" ;;
+    s6) [[ $sig == USR1 ]] && echo "s6-svc -1 $(s6_scandir)/$n" || echo "s6-svc -h $(s6_scandir)/$n" ;;
+    dinit) echo "dinitctl signal $sig $n" ;;
+    *) if have service; then echo "service $n reload"; else echo "$ETC/init.d/$n reload"; fi ;;
+  esac
+}
+
+# svc_enable_now NAME: start NAME now and at every boot
+svc_enable_now() {
+  local n=$1 src="" d
+  case $(init_system) in
+    systemd) run systemctl enable --now "$n" ;;
+    openrc) run rc-update add "$n" default; run rc-service "$n" start ;;
+    runit)
+      for d in $(runit_sources); do [[ -d $d/$n ]] && { src=$d/$n; break; }; done
+      [[ -n $src ]] || { warn "no runit service '$n' in $(runit_sources | tr '\n' ' '); start it yourself"; return 0; }
+      run ln -sfn "$src" "$(runit_dir)/$n"
+      # runsvdir notices new services every few seconds
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        (( DRY_RUN )) || [[ $FAKE == 1 ]] || [[ -e $(runit_dir)/$n/supervise/ok ]] && break
+        sleep 1
+      done
+      run sv up "$(runit_dir)/$n" || true ;;
+    s6)
+      if have s6-service; then run s6-service add default "$n"; run s6-db-reload; run s6-rc -u change "$n"
+      elif have s6-rc && [[ -d /run/s6-rc ]]; then
+        run s6-rc -u change "$n"
+        warn "add $n to your s6-rc default bundle (then s6-rc-compile) so it starts at boot"
+      else
+        for d in $(s6_sources); do [[ -d $d/$n ]] && { src=$d/$n; break; }; done
+        [[ -n $src ]] || { warn "no s6 service '$n' found; start it yourself"; return 0; }
+        run ln -sfn "$src" "$(s6_scandir)/$n"; run s6-svscanctl -a "$(s6_scandir)"
+      fi ;;
+    dinit) run dinitctl enable "$n" ;;
+    sysv)
+      if have update-rc.d; then run update-rc.d "$n" defaults
+      elif have chkconfig; then run chkconfig "$n" on; fi
+      if have service; then run service "$n" start; else run "$ETC/init.d/$n" start; fi ;;
+    *) warn "no init system found; start $n yourself" ;;
+  esac
+}
+
+# Re-read service definitions after editing them (only systemd caches them).
+svc_reread() { [[ $(init_system) == systemd ]] && run systemctl daemon-reload; return 0; }
+
+# svc_files: "service<TAB>file" for every file that defines how a service runs
+svc_files() {
+  local f d
+  case $(init_system) in
+    systemd)
+      for f in "$ETC"/systemd/system/*.service; do [[ -f $f ]] && printf '%s\t%s\n' "$(basename "$f" .service)" "$f"; done
+      for f in "$ETC"/systemd/system/*.service.d/*.conf; do [[ -f $f ]] && printf '%s\t%s\n' "$(basename "$(dirname "$f")" .service.d)" "$f"; done ;;
+    openrc|sysv)
+      for f in "$ETC"/init.d/* "$ETC"/conf.d/* "$ETC"/default/*; do [[ -f $f ]] && printf '%s\t%s\n' "${f##*/}" "$f"; done ;;
+    runit|s6)
+      local srcs; if [[ $(init_system) == runit ]]; then srcs=$(runit_sources); else srcs=$(s6_sources); fi
+      for d in $srcs; do
+        for f in "$d"/*/run "$d"/*/up "$d"/*/conf "$d"/*/env/*; do
+          [[ -f $f ]] || continue
+          local rel=${f#"$d"/}; printf '%s\t%s\n' "${rel%%/*}" "$f"
+        done
+      done
+      for f in "$ETC"/s6/config/*.conf; do [[ -f $f ]] && printf '%s\t%s\n' "$(basename "$f" .conf)" "$f"; done ;;
+    dinit)
+      for f in "$ETC"/dinit.d/* "$ETC"/dinit.d/*/*; do [[ -f $f ]] && printf '%s\t%s\n' "$(basename "$f")" "$f"; done ;;
+  esac
+  return 0
+}
+
+# svc_runtime_change OLD_FILE NEW_TEXT: does the change touch how the service
+# runs (so it needs a restart)? For systemd only Exec/Environment/WorkingDirectory
+# lines count; for script-based inits any change does.
+svc_runtime_change() {
+  if [[ $(init_system) == systemd ]]; then
+    diff <(cat "$1") <(printf '%s\n' "$2") | grep -qE '^[<>] *(Exec|Environment|WorkingDirectory)'
+  else
+    [[ $(<"$1") != "$2" ]]
+  fi
+}
+
+reload_server() {
+  local svc sig=HUP
+  svc=$(server_service "$1")
+  [[ $1 == apache ]] && sig=USR1
+  svc_reload "$svc" "$sig"
 }
 
 prepare_dirs() {
@@ -634,6 +894,7 @@ apply_site() {
   path=$(conf_path "$server" "$DOMAIN")
   layout=$(server_layout "$server")
   prepare_dirs
+  ensure_include "$server"
 
   if [[ $server == nginx ]]; then
     [[ $TYPE == custom ]] && die "$DOMAIN is a custom (adopted) site; those are Apache only"
@@ -754,7 +1015,7 @@ issue_cert() {
   [[ $FAKE == 1 && -n ${HM_FAKE_CERT_FAIL:-} ]] && { warn "(test) certbot failed"; return 1; }
   run certbot certonly --webroot -w "$ACME_ROOT" --cert-name "$DOMAIN" \
     --non-interactive --agree-tos --keep-until-expiring \
-    --deploy-hook "systemctl reload $(server_service "$SERVER")" "${args[@]}" || return 1
+    --deploy-hook "$(svc_reload_cmd "$(server_service "$SERVER")" "$([[ $SERVER == apache ]] && echo USR1 || echo HUP)")" "${args[@]}" || return 1
   CERT_FILE=""; CERT_KEY=""
 }
 
@@ -1183,29 +1444,29 @@ names_resolve() {
   done
 }
 
-# rename_in_units OLD NEW: replace the host name in systemd services (not inside
-# paths such as /var/www/OLD), reload systemd and restart the running services
-# whose command or environment changed.
+# rename_in_units OLD NEW: replace the host name in service definitions (systemd
+# units, OpenRC/SysV scripts and conf.d/default files, runit/s6 run scripts,
+# dinit services; not inside paths such as /var/www/OLD), then restart the
+# running services whose command or environment changed.
 rename_in_units() {
-  local old=$1 new=$2 f changed=() keep="$BACKUP_DIR/$STAMP-units"
-  for f in "$ETC"/systemd/system/*.service "$ETC"/systemd/system/*.service.d/*.conf; do
+  local old=$1 new=$2 f svc changed=() keep="$BACKUP_DIR/$STAMP-units"
+  while IFS=$'\t' read -r svc f; do
     [[ -f $f ]] || continue
     local t; t=$(HM_OLD=$old HM_NEW=$new perl -0777 -pe 's{(?<![A-Za-z0-9./_-])\Q$ENV{HM_OLD}\E(?![A-Za-z0-9-])}{$ENV{HM_NEW}}g' "$f")
     [[ $t == "$(<"$f")" ]] && continue
     if (( DRY_RUN )); then echo "${C_DIM}+ rewrite $f${C_RST}"; continue; fi
     mkdir -p "$keep"; cp -a "$f" "$keep/${f//\//_}"
     local restart=0
-    diff <(cat "$f") <(printf '%s\n' "$t") | grep -qE '^[<>] *(Exec|Environment|WorkingDirectory)' && restart=1
+    svc_runtime_change "$f" "$t" && restart=1
     printf '%s\n' "$t" > "$f"
-    local svc=${f##*/}; [[ $f == *.service.d/* ]] && svc=$(basename "$(dirname "$f")" .d)
-    info "updated $svc"
-    (( restart )) && changed+=("$svc")
-  done
+    info "updated $svc ($f)"
+    (( restart )) && [[ " ${changed[*]} " != *" $svc "* ]] && changed+=("$svc")
+  done < <(svc_files)
   (( DRY_RUN )) && return 0
-  run systemctl daemon-reload
+  svc_reread
   local v
   for v in "${changed[@]}"; do
-    if [[ $FAKE == 1 ]] || systemctl is-active --quiet "$v"; then run systemctl restart "$v"; info "restarted $v"; fi
+    if svc_active "$v"; then svc_restart "$v"; info "restarted $v"; fi
   done
   return 0
 }
@@ -1276,13 +1537,19 @@ cmd_test() {
 cmd_reload() {
   need_root
   local s
-  for s in nginx apache; do server_installed "$s" && reload_server "$s"; done
+  for s in nginx apache; do
+    server_installed "$s" || continue
+    # an installed but stopped server (e.g. nginx next to Apache) is left alone
+    if svc_active "$(server_service "$s")"; then reload_server "$s"
+    else info "$s is installed but not running; not reloaded"; fi
+  done
   return 0
 }
 
 cmd_doctor() {
   local s ok="${C_GRN}ok${C_RST}" no="${C_YLW}missing${C_RST}"
   echo "${C_BLD}$PROG $VERSION${C_RST}"
+  printf '%-10s %s\n' init "$(init_system)"
   for s in nginx apache; do
     if server_installed "$s"; then
       local v=""
@@ -1317,7 +1584,11 @@ cmd_install() {
   elif have dnf; then pm=dnf
   elif have yum; then pm=yum
   elif have pacman; then pm=pacman
-  else die "no supported package manager (apt, dnf, yum, pacman)"; fi
+  elif have apk; then pm=apk
+  elif have xbps-install; then pm=xbps
+  elif have zypper; then pm=zypper
+  elif have emerge; then pm=emerge
+  else die "no supported package manager (apt, dnf, yum, pacman, apk, xbps, zypper, emerge)"; fi
   for what in "$@"; do
     case $pm:$what in
       apt:nginx) pkgs+=(nginx) ;;
@@ -1332,6 +1603,22 @@ cmd_install() {
       pacman:apache) pkgs+=(apache) ;;
       pacman:certbot) pkgs+=(certbot) ;;
       pacman:php) pkgs+=(php-fpm) ;;
+      apk:nginx) pkgs+=(nginx) ;;
+      apk:apache) pkgs+=(apache2 apache2-ssl apache2-proxy) ;;
+      apk:certbot) pkgs+=(certbot) ;;
+      apk:php) pkgs+=(php-fpm) ;;
+      xbps:nginx) pkgs+=(nginx) ;;
+      xbps:apache) pkgs+=(apache) ;;
+      xbps:certbot) pkgs+=(certbot) ;;
+      xbps:php) pkgs+=(php-fpm) ;;
+      zypper:nginx) pkgs+=(nginx) ;;
+      zypper:apache) pkgs+=(apache2) ;;
+      zypper:certbot) pkgs+=(python3-certbot) ;;
+      zypper:php) pkgs+=(php-fpm) ;;
+      emerge:nginx) pkgs+=(www-servers/nginx) ;;
+      emerge:apache) pkgs+=(www-servers/apache) ;;
+      emerge:certbot) pkgs+=(app-crypt/certbot) ;;
+      emerge:php) pkgs+=(dev-lang/php) ;;
       *) die "don't know how to install '$what' (choose nginx, apache, certbot, php)" ;;
     esac
   done
@@ -1339,17 +1626,19 @@ cmd_install() {
     apt) run apt-get update; run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" ;;
     dnf|yum) run "$pm" install -y "${pkgs[@]}" ;;
     pacman) run pacman -S --needed --noconfirm "${pkgs[@]}" ;;
+    apk) run apk add "${pkgs[@]}" ;;
+    xbps) run xbps-install -Sy "${pkgs[@]}" ;;
+    zypper) run zypper --non-interactive install "${pkgs[@]}" ;;
+    emerge) run emerge --noreplace "${pkgs[@]}" ;;
   esac
-  if have systemctl; then
-    for what in "$@"; do
-      case $what in
-        nginx) run systemctl enable --now nginx ;;
-        apache) run systemctl enable --now "$(apache_service)" ;;
-        php) local u; u=$(systemctl list-unit-files 'php*-fpm.service' --no-legend 2>/dev/null | awk '{print $1}' | sort -V | tail -1)
-             if [[ -n $u ]]; then run systemctl enable --now "$u"; fi ;;
-      esac
-    done
-  fi
+  for what in "$@"; do
+    case $what in
+      nginx) svc_enable_now nginx ;;
+      apache) svc_enable_now "$(apache_service)" ;;
+      php) local u; u=$(svc_names | grep -E '^php.*fpm' | sort -V | tail -1 || true)
+           if [[ -n $u ]]; then svc_enable_now "$u"; else warn "no php-fpm service found; start it yourself"; fi ;;
+    esac
+  done
   if have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
     info "ufw is active; opening ports 80 and 443"
     run ufw allow 80,443/tcp
@@ -1378,7 +1667,7 @@ EMAIL=$(printf '%q' "$EMAIL")"
 # ---------------------------------------------------------------------------
 # Safety net for changes to many sites: whole-tree backup, probes before/after
 # ---------------------------------------------------------------------------
-apache_dir() { if [[ $(apache_layout) == confd ]]; then echo "$ETC/httpd"; else echo "$ETC/apache2"; fi; }
+apache_dir() { if [[ $(apache_layout) == confd ]]; then dirname "$(apache_confd)"; else echo "$ETC/apache2"; fi; }
 
 # Archive the Apache tree and the site records; restore_tree puts both back.
 backup_tree() {
@@ -1508,7 +1797,7 @@ cmd_check() {
 apache_sources() {
   local d f
   if [[ $(apache_layout) == confd ]]; then
-    for f in "$ETC"/httpd/conf.d/*.conf; do [[ -f $f ]] && echo "conf.d $f $f"; done
+    for f in "$(apache_confd)"/*.conf; do [[ -f $f ]] && echo "conf.d $f $f"; done
     return 0
   fi
   for d in conf-enabled sites-enabled; do
@@ -1777,8 +2066,11 @@ cmd_relocate() {
     if (( confs )); then echo "other Apache files to update:"; else echo "other Apache files that mention it (not changed; add --rewrite-confs):"; fi
     printf '  %s\n' "${others[@]}"
   fi
-  local unit_files=() u
-  mapfile -t unit_files < <(grep -lF "$old" "$ETC"/systemd/system/*.service "$ETC"/systemd/system/*.service.d/*.conf 2>/dev/null || true)
+  local unit_files=() unit_names=() u un
+  while IFS=$'\t' read -r un u; do
+    grep -qF "$old" "$u" 2>/dev/null || continue
+    unit_files+=("$u"); unit_names+=("$un")
+  done < <(svc_files)
   if (( ${#unit_files[@]} )); then
     if (( units )); then echo "services that run from it (rewritten and restarted):"
     else echo "services that run from it (not changed; add --rewrite-units):"; fi
@@ -1824,16 +2116,15 @@ cmd_relocate() {
 
   backup_tree relocate
   local unit_keep="$BACKUP_DIR/$STAMP-units" services=()
-  for u in "${unit_files[@]}"; do
-    local svc=${u##*/}; [[ $u == *.service.d/* ]] && svc=$(basename "$(dirname "$u")" .d)
-    [[ " ${services[*]} " == *" $svc "* ]] || services+=("$svc")
+  for un in "${unit_names[@]}"; do
+    [[ " ${services[*]} " == *" $un "* ]] || services+=("$un")
   done
   restore_units() {
     (( units )) || return 0
     local f
     for f in "${unit_files[@]}"; do [[ -f $unit_keep/${f//\//_} ]] && cp -a "$unit_keep/${f//\//_}" "$f"; done
     if (( ${#unit_files[@]} )) && [[ $FAKE != 1 ]]; then
-      systemctl daemon-reload; local v; for v in "${services[@]}"; do systemctl restart "$v" || true; done
+      svc_reread; local v; for v in "${services[@]}"; do svc_restart "$v" || true; done
     fi
   }
   fail_back() { restore_tree; restore_units; rm -rf -- "$new"; die "$1; everything was put back and $new removed"; }
@@ -1864,14 +2155,14 @@ cmd_relocate() {
       local t; t=$(replace_path "$(<"$u")" "$old" "$new")
       printf '%s\n' "$t" > "$u"
     done
-    run systemctl daemon-reload
+    svc_reread
     local v
     for v in "${services[@]}"; do
-      run systemctl restart "$v" || fail_back "$v did not restart"
+      svc_restart "$v" || fail_back "$v did not restart"
     done
     sleep 3
     if [[ $FAKE != 1 ]]; then
-      for v in "${services[@]}"; do systemctl is-active --quiet "$v" || fail_back "$v is not running after the move"; done
+      for v in "${services[@]}"; do svc_active "$v" || fail_back "$v is not running after the move"; done
     fi
     info "services moved: ${services[*]}"
   fi
@@ -1920,7 +2211,8 @@ Sites
       --wait-dns                  wait until the new names resolve, then rename (run it in the
                                   background); --expect-ip IP, --timeout DAYS (default 14)
       --drop-aliases              don't carry the extra names over
-      --rewrite-units             also replace the host name in systemd services, restart them
+      --rewrite-units             also replace the host name in service definitions
+                                  (systemd, OpenRC, SysV, runit, s6, dinit), restart them
       --keep-root                 don't move $WWW/<old> to $WWW/<new>
       --delete-old-cert           delete <old>'s certificate
   alias <domain> add|remove NAME..  add or remove extra names
@@ -1934,7 +2226,7 @@ Sites
   relocate <old-dir> <new-dir>    copy web files elsewhere and switch every site using them
       --fix-app-paths             also rewrite the path inside app files (.php, .ini, .env, ...)
       --rewrite-confs             also rewrite other Apache files that mention it
-      --rewrite-units             also rewrite systemd services that run from it, and restart them
+      --rewrite-units             also rewrite services that run from it (any init), restart them
       --delete-old                delete <old-dir> after a successful switch
   check [--save F] [--compare F]  how each site answers (status, redirect), or compare with F
   default <domain>                the site that answers names no other site claims
@@ -1971,6 +2263,8 @@ EOF
 main() {
   # shellcheck disable=SC1090
   [[ -r $CONFIG_FILE ]] && source "$CONFIG_FILE"
+  init_system >/dev/null   # detect once; later $(init_system) calls reuse it
+  export HM_INIT=$INIT_SYSTEM
   while (($#)); do
     case $1 in
       --dry-run|-n) DRY_RUN=1; shift ;;

@@ -10,7 +10,7 @@ HM="$HERE/../hosting-manager.sh"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
-export HM_ETC=$T/etc HM_WWW=$T/www HM_LE=$T/le HM_NGINX_LOGS=$T/logs HM_FAKE=1 HM_IPV6=${HM_IPV6:-0}
+export HM_ETC=$T/etc HM_WWW=$T/www HM_LE=$T/le HM_NGINX_LOGS=$T/logs HM_FAKE=1 HM_IPV6=${HM_IPV6:-0} HM_INIT=systemd
 mkdir -p "$T"/etc/nginx/{sites-available,sites-enabled,conf.d} \
          "$T"/etc/apache2/{sites-available,sites-enabled,mods-enabled,conf-available,conf-enabled} "$T"/www "$T"/logs
 
@@ -137,9 +137,34 @@ hm rename pay.legacy.test pay.newname.test --force
 hm create part.legacy.test --server apache --proxy 7002 --no-www --alias part.other.test
 echo "part.legacy.test 192.0.2.9" > "$T/dns2"; echo "part.other.test 198.51.100.1" >> "$T/dns2"
 HM_FAKE_DNS=$T/dns2 bash "$HM" ssl part.legacy.test --expect-ip 192.0.2.9 > "$T/part.log" 2>&1 || true
+# other init systems: service definitions rewritten, restarted the right way
+mkdir -p "$T"/etc/init.d "$T"/etc/conf.d "$T"/etc/default "$T"/etc/sv/hub3/env "$T"/etc/s6/sv/hub4 "$T"/etc/dinit.d "$T"/run/service "$T"/run/runit
+printf '#!/sbin/openrc-run\ncommand=/usr/bin/hub\n' > "$T/etc/init.d/hub1"; chmod +x "$T/etc/init.d/hub1"
+printf 'command_args="-r hub1.legacy.test:21117"\n' > "$T/etc/conf.d/hub1"
+printf '#!/bin/sh\n# sysv\nDAEMON_ARGS="-r hub2.legacy.test"\n' > "$T/etc/init.d/hub2"; chmod +x "$T/etc/init.d/hub2"
+printf '#!/bin/sh\nexec /usr/bin/hub -r hub3.legacy.test\n' > "$T/etc/sv/hub3/run"
+printf 'hub3.legacy.test' > "$T/etc/sv/hub3/env/RELAY"
+printf '#!/bin/execlineb -P\n/usr/bin/hub -r hub4.legacy.test\n' > "$T/etc/s6/sv/hub4/run"
+printf 'type = process\ncommand = /usr/bin/hub -r hub5.legacy.test\n' > "$T/etc/dinit.d/hub5"
+i=1
+for init in openrc sysv runit s6 dinit; do
+  hm create hub$i.legacy.test --server apache --proxy 710$i --no-www
+  HM_INIT=$init HM_RUNIT_DIR=$T/run/runit HM_S6_SCANDIR=$T/run/service bash "$HM" rename hub$i.legacy.test hub$i.newname.test --rewrite-units > "$T/init-$init.log" 2>&1 || true
+  i=$((i+1))
+done
+HM_INIT=openrc bash "$HM" create hook1.test --server nginx --ssl --no-www > "$T/hook-openrc.log" 2>&1 || true
+HM_INIT=s6 HM_S6_SCANDIR=$T/run/service bash "$HM" create hook2.test --server apache --ssl --no-www > "$T/hook-s6.log" 2>&1 || true
+HM_INIT=runit HM_RUNIT_DIR=$T/run/runit bash "$HM" create hook3.test --server apache --ssl --no-www > "$T/hook-runit.log" 2>&1 || true
 # a site whose web root folder is named after it: files stay, so the path must too
 hm rename old23.legacy.test old23.newname.test
 
+# stock configs without a drop-in folder (Void, Arch): the include is added once
+V=$T/void; mkdir -p "$V"/etc/nginx "$V"/etc/apache
+printf 'worker_processes 1;\nevents { }\nhttp {\n    include mime.types;\n}\n' > "$V/etc/nginx/nginx.conf"
+printf 'ServerRoot "/etc/apache"\nListen 80\n' > "$V/etc/apache/httpd.conf"
+HM_ETC=$V/etc HM_INIT=runit bash "$HM" create v1.test --server nginx --no-www > "$T/void.log" 2>&1 || true
+HM_ETC=$V/etc HM_INIT=runit bash "$HM" create v2.test --server nginx --no-www >> "$T/void.log" 2>&1 || true
+HM_ETC=$V/etc HM_INIT=runit bash "$HM" create v3.test --server apache --no-www >> "$T/void.log" 2>&1 || true
 n=$T/etc/nginx; a=$T/etc/apache2
 check "nginx static site enabled"        "[[ -L $n/sites-enabled/static.test.conf ]]"
 check "www alias added for apex domain"  "grep -q 'server_name static.test www.static.test;' $n/sites-available/static.test.conf"
@@ -158,7 +183,7 @@ check "apache php handler"               "grep -q 'proxy:unix:/run/php/php-fpm.s
 check "apache https upstream"            "grep -q 'SSLProxyEngine on' $a/sites-available/a-proxy.test.conf"
 check "apache upload limit"              "grep -q 'LimitRequestBody 10485760' $a/sites-available/a-plain.test.conf"
 check "apache rename without redirect"   "[[ ! -e $a/sites-available/a-old.test.conf && -f $a/sites-available/a-new.test.conf ]]"
-check "list shows 21 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 21 ]]"
+check "list shows 29 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 29 ]]"
 check "adopt: one file per site"         "[[ -f $a/sites-available/shop.legacy.test.conf && -f $a/sites-available/blog.legacy.test.conf ]]"
 check "adopt: port and directives kept"  "grep -q '<VirtualHost \*:3000>' $a/sites-available/shop.legacy.test.conf && grep -q 'php_admin_value open_basedir' $a/sites-available/shop.legacy.test.conf"
 check "adopt: aliases kept"              "grep -q 'ServerAlias www.shop.legacy.test' $a/sites-available/shop.legacy.test.conf"
@@ -178,6 +203,16 @@ check "rename adopted: names in body"    "grep -q 'RewriteCond %{SERVER_NAME} =p
 check "rename: paths keep the old name"  "grep -q 'DocumentRoot /srv/sites/old23.legacy.test' $a/sites-available/old23.newname.test.conf && grep -q 'ErrorLog /var/log/apache2/old23.legacy.test-error.log' $a/sites-available/old23.newname.test.conf"
 check "rename: URLs get the new name"   "grep -q 'Redirect 302 /go https://old23.newname.test/landing' $a/sites-available/old23.newname.test.conf && grep -q 'ServerName old23.newname.test' $a/sites-available/old23.newname.test.conf"
 check "ssl --expect-ip: skips other IPs"  "grep -q 'left out of the certificate.*part.other.test' $T/part.log && grep -q 'certificate for: part.legacy.test\$' $T/part.log"
+check "openrc: conf.d rewritten, restarted"  "grep -q 'hub1.newname.test:21117' $T/etc/conf.d/hub1 && grep -q '+ rc-service hub1 restart' $T/init-openrc.log"
+check "sysv: init script rewritten"      "grep -q 'hub2.newname.test' $T/etc/init.d/hub2 && grep -qE '\+ (service hub2|.*/init.d/hub2) restart' $T/init-sysv.log"
+check "runit: run + env rewritten"       "grep -q 'hub3.newname.test' $T/etc/sv/hub3/run && grep -q 'hub3.newname.test' $T/etc/sv/hub3/env/RELAY && grep -q '+ sv restart $T/run/runit/hub3' $T/init-runit.log"
+check "s6: run script rewritten"         "grep -q 'hub4.newname.test' $T/etc/s6/sv/hub4/run && grep -q '+ s6-svc -r $T/run/service/hub4' $T/init-s6.log"
+check "dinit: service rewritten"         "grep -q 'hub5.newname.test' $T/etc/dinit.d/hub5 && grep -q '+ dinitctl restart hub5' $T/init-dinit.log"
+check "openrc: nginx reload + hook"      "grep -q -- '--deploy-hook rc-service nginx reload' $T/hook-openrc.log && grep -q '+ rc-service nginx reload' $T/hook-openrc.log"
+check "s6: apache graceful via USR1"     "grep -q -- '--deploy-hook s6-svc -1 $T/run/service/apache2' $T/hook-s6.log && grep -q '+ s6-svc -1 $T/run/service/apache2' $T/hook-s6.log"
+check "runit: apache graceful via sv 1"  "grep -q '+ sv 1 $T/run/runit/apache2' $T/hook-runit.log"
+check "void nginx: include added once"   "[[ \$(grep -c 'include $V/etc/nginx/conf.d/\*.conf' $V/etc/nginx/nginx.conf) -eq 1 ]] && [[ -f $V/etc/nginx/conf.d/v1.test.conf && -f $V/etc/nginx/conf.d/v2.test.conf ]]"
+check "void apache: IncludeOptional"     "grep -q 'IncludeOptional $V/etc/apache/conf.d/\*.conf' $V/etc/apache/httpd.conf && [[ -f $V/etc/apache/conf.d/v3.test.conf ]]"
 check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
 check "--dns-server option accepted"     "bash $HM --dns-server 192.0.2.1 list >/dev/null 2>&1"
 check "check is its own command"         "bash $HM check >/dev/null 2>&1 && ! bash $HM check | grep -q '^hosting-manager '"
