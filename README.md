@@ -260,6 +260,25 @@ hosting-manager --dry-run create example.com --php --ssl
 
 ## Usage reference
 
+`hosting-manager help` lists every command; `hosting-manager help examples` walks through
+real-world scenarios (first site, WordPress, an app behind a proxy, moving domains, DNS that
+isn't ready yet, taking over a panel-migrated server, ...), and `hosting-manager help <command>`
+shows one command's options together with the scenarios that use it:
+
+```console
+$ hosting-manager help alias
+Usage
+  alias <domain> add|remove NAME..  add or remove extra names
+
+Add www, a second domain or a typo domain to a site
+  sudo hosting-manager alias example.com add example.net www.example.net
+  sudo hosting-manager alias example.com remove example.net www.example.net
+  # HTTPS sites get a certificate covering the new names right away
+
+A site on two domains, only one of which points here yet
+  ...
+```
+
 ```
 hosting-manager [--dry-run] [-y] <command> [arguments]
 ```

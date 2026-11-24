@@ -213,6 +213,9 @@ check "s6: apache graceful via USR1"     "grep -q -- '--deploy-hook s6-svc -1 $T
 check "runit: apache graceful via sv 1"  "grep -q '+ sv 1 $T/run/runit/apache2' $T/hook-runit.log"
 check "void nginx: include added once"   "[[ \$(grep -c 'include $V/etc/nginx/conf.d/\*.conf' $V/etc/nginx/nginx.conf) -eq 1 ]] && [[ -f $V/etc/nginx/conf.d/v1.test.conf && -f $V/etc/nginx/conf.d/v2.test.conf ]]"
 check "void apache: IncludeOptional"     "grep -q 'IncludeOptional $V/etc/apache/conf.d/\*.conf' $V/etc/apache/httpd.conf && [[ -f $V/etc/apache/conf.d/v3.test.conf ]]"
+help_rename=$(bash "$HM" help rename)
+check "help rename: usage + scenarios"   "grep -q -- '--wait-dns' <<<\"\$help_rename\" && grep -q 'Move a site to a new domain' <<<\"\$help_rename\""
+check "help examples: commands are real" "for c in \$(bash $HM help examples | grep -oE '^ *(sudo )?(HM_[A-Z]+=[a-z]+ )?hosting-manager( --[a-z-]+( [0-9.]+)?)* [a-z]+' | awk '{print \$NF}' | sort -u); do bash $HM help \$c >/dev/null 2>&1 || { echo \"  no help for \$c\"; exit 1; }; done"
 check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
 check "--dns-server option accepted"     "bash $HM --dns-server 192.0.2.1 list >/dev/null 2>&1"
 check "check is its own command"         "bash $HM check >/dev/null 2>&1 && ! bash $HM check | grep -q '^hosting-manager '"

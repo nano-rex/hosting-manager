@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -2255,9 +2255,148 @@ Global options
 Examples
   sudo $PROG create example.com --ssl --email me@example.com
   sudo $PROG create app.example.com --proxy 3000 --ssl
-  sudo $PROG create blog.example.com --php --server apache
   sudo $PROG rename example.com example.org --redirect
+
+More help
+  $PROG help examples             real-world scenarios, step by step
+  $PROG help <command>            one command's options and scenarios, e.g. help rename
 EOF
+}
+
+# Real-world scenarios. Each starts with "@topics title"; help <command> shows
+# the ones whose topics include that command.
+examples() {
+  cat <<EOF
+@install,create,ssl,config First website on a fresh server (nginx + HTTPS)
+  # DNS first: A records for example.com and www.example.com -> this server's IP
+  sudo $PROG install nginx certbot
+  sudo $PROG config email you@example.com        # Let's Encrypt expiry notices
+  sudo $PROG create example.com --ssl            # serves $WWW/example.com, adds www
+  sudo rsync -a ./public/ $WWW/example.com/      # upload the site
+
+@install,create,ssl WordPress (or any PHP app) on Apache, with big uploads
+  sudo $PROG install apache certbot php
+  sudo $PROG create blog.example.com --php --server apache --max-body 64M --ssl
+  # unpack WordPress into $WWW/blog.example.com, then open https://blog.example.com
+
+@create,ssl,update Node/Python/Docker app behind the web server
+  sudo $PROG create app.example.com --proxy 3000 --ssl       # app on 127.0.0.1:3000
+  sudo $PROG create git.example.com --proxy http://10.0.0.5:8080 --ssl
+  sudo $PROG update app.example.com --proxy 3100             # the app moved port
+
+@create,ssl Keep an old domain alive as a redirect
+  sudo $PROG create old-brand.com --redirect-to https://new-brand.com --ssl
+
+@alias,ssl Add www, a second domain or a typo domain to a site
+  sudo $PROG alias example.com add example.net www.example.net
+  sudo $PROG alias example.com remove example.net www.example.net
+  # HTTPS sites get a certificate covering the new names right away
+
+@rename,ssl Move a site to a new domain, old one keeps redirecting
+  # DNS for the new name must already point here (HTTPS needs it)
+  sudo $PROG --dry-run rename shop.example.com shop.example.org --redirect
+  sudo $PROG rename shop.example.com shop.example.org --redirect
+
+@rename Switch domains as soon as DNS is ready (unattended)
+  # systemd: runs in the background, checks every 5 minutes
+  sudo systemd-run --unit hm-rename-shop $PROG rename shop.example.com shop.example.org \\
+       --wait-dns --expect-ip 203.0.113.10 --delete-old-cert
+  journalctl -u hm-rename-shop -f
+  # OpenRC/runit/s6/SysV: same, with nohup
+  sudo nohup $PROG rename shop.example.com shop.example.org --wait-dns \\
+       > /var/log/hm-rename-shop.log 2>&1 &
+
+@rename An app that announces its own host name (e.g. a relay server)
+  # also replaces the name in its service file and restarts it
+  sudo $PROG rename relay.example.com relay.example.org --rewrite-units
+
+@ssl "DNS is fixed but certbot says the name doesn't resolve"
+  # the server's resolver (often the router) still remembers the old answer
+  sudo $PROG --dns-server 1.1.1.1 ssl app.example.com
+
+@ssl,alias A site on two domains, only one of which points here yet
+  sudo $PROG alias app.example.com add app.example.net
+  sudo $PROG --dns-server 1.1.1.1 ssl app.example.com --expect-ip 203.0.113.10
+  # once the other domain points here too, cover both names:
+  sudo $PROG ssl app.example.com
+
+@ssl,renew,certs,info Certificate check-up
+  sudo $PROG certs                       # every certificate and its expiry
+  sudo $PROG info example.com            # one site: settings, config file, expiry
+  sudo $PROG renew --test                # dry run of the automatic renewal
+  sudo $PROG ssl example.com --staging   # try issuing against the test CA first
+
+@update,disable,enable,remove Change, pause or delete a site
+  sudo $PROG update example.com --max-body 256M   # bigger uploads
+  sudo $PROG update example.com --root /srv/example/current
+  sudo $PROG disable example.com                  # offline, config kept
+  sudo $PROG enable example.com
+  sudo $PROG remove example.com --delete-cert     # files kept unless --purge
+
+@adopt,check Take over a hand-made or panel-migrated Apache server
+  sudo $PROG check --save /root/before.txt        # how every site answers now
+  sudo $PROG --dry-run adopt --all                # the plan, changes nothing
+  sudo $PROG adopt --all                          # one file per site, checked and reloaded
+  sudo $PROG check --compare /root/before.txt     # every site must answer the same
+
+@relocate,check Move site files out of /home
+  sudo $PROG --dry-run relocate /home/alice/public_html $WWW/alice
+  sudo $PROG relocate /home/alice/public_html $WWW/alice --fix-app-paths --rewrite-units
+  # all good for a while? remove the old copy:
+  sudo rm -rf /home/alice/public_html
+
+@default Unknown names (or the bare IP) show the wrong site
+  sudo $PROG default example.com
+
+@doctor,test,show,reload Something isn't working
+  $PROG doctor                    # web servers, certbot, php-fpm, init system, ports
+  sudo $PROG test                 # nginx -t / apachectl configtest
+  sudo $PROG show example.com     # the config hosting-manager generated
+  sudo $PROG reload
+
+@install,doctor,reload Alpine (OpenRC), Void (runit), Artix (s6), Devuan (SysV)
+  # same commands everywhere; the init system is detected from PID 1
+  sudo $PROG install nginx certbot
+  $PROG doctor | grep init
+  sudo HM_INIT=openrc $PROG reload       # override detection if needed
+EOF
+}
+
+cmd_help() {
+  local topic=${1:-}
+  case $topic in
+    "") usage; return ;;
+    examples|scenarios) topic="" ;;
+    *)
+      # the command's own lines from the usage text
+      local lines
+      lines=$(usage | awk -v c="$topic" '
+        $0 ~ "^  " c "( |$)" || $0 ~ "^  [a-z].*[|] " c "( |$)" { on=1; print; next }
+        on && /^      / { print; next }
+        { on=0 }')
+      [[ -n $lines ]] || die "no help for '$topic' (see: $PROG help)"
+      printf '%sUsage%s\n%s\n\n' "$C_BLD" "$C_RST" "$lines" ;;
+  esac
+  # print the chosen scenarios, lining up each one's trailing comments
+  examples | awk -v t="$topic" -v b="$C_BLD" -v r="$C_RST" '
+    function flush(   i, w, c, k) {
+      w = 0
+      for (i = 1; i <= m; i++) if (cm[i] != "" && length(cd[i]) > w) w = length(cd[i])
+      if (w > 64) w = 64
+      for (i = 1; i <= m; i++) {
+        if (cm[i] == "") print cd[i]
+        else printf "%-" w "s  %s\n", cd[i], cm[i]
+      }
+      m = 0
+    }
+    /^@/ { flush(); split(substr($1, 2), tags, ","); show = (t == ""); for (i in tags) if (tags[i] == t) show = 1
+           if (show) { sub(/^@[^ ]+ /, ""); print b $0 r; n++ } ; next }
+    show {
+      m++; cd[m] = $0; cm[m] = ""
+      k = index($0, "   # ")
+      if (k > 0 && $0 !~ /^ *#/) { cd[m] = substr($0, 1, k - 1); sub(/ +$/, "", cd[m]); cm[m] = substr($0, k + 3) }
+    }
+    END { flush(); if (!n) print "(no scenarios for " t "; see: help examples)" }'
 }
 
 main() {
@@ -2309,7 +2448,8 @@ main() {
     relocate) cmd_relocate "$@" ;;
     check) cmd_check "$@" ;;
     default) cmd_default "$@" ;;
-    help|-h|--help) usage ;;
+    help|-h|--help) cmd_help "$@" ;;
+    examples) cmd_help examples ;;
     version|-V|--version) echo "$PROG $VERSION" ;;
     *) die "unknown command '$cmd' (see: $PROG help)" ;;
   esac
