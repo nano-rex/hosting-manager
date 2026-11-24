@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -930,9 +930,12 @@ replace_path() {
 }
 
 # replace_domain TEXT OLD NEW: replace the host name OLD (also as the end of a
-# longer name like www.OLD), but not inside other names such as my-OLD.
+# longer name like www.OLD), but not inside other names such as my-OLD, and not
+# inside file paths such as /var/www/OLD or /var/log/apache2/OLD-error.log
+# (URLs like https://OLD/ are still replaced). Paths are left to replace_path,
+# so a site whose files stay put keeps working.
 replace_domain() {
-  printf '%s' "$1" | HM_OLD=$2 HM_NEW=$3 perl -0777 -pe 's{(?<![A-Za-z0-9-])\Q$ENV{HM_OLD}\E(?![A-Za-z0-9-])}{$ENV{HM_NEW}}g'
+  printf '%s' "$1" | HM_OLD=$2 HM_NEW=$3 perl -0777 -pe 's{(?<![A-Za-z0-9-])(?<![^/]/)(?<!^/)\Q$ENV{HM_OLD}\E(?![A-Za-z0-9-])}{$ENV{HM_NEW}}gm'
 }
 
 words_without() {
@@ -1072,11 +1075,6 @@ cmd_rename() {
     # shellcheck disable=SC2086
     check_dns $new ${new_aliases[*]} || die "fix DNS for the new names first (or pass --wait-dns, or --force to rename anyway and stay on plain HTTP)"
   fi
-  if [[ $TYPE == custom ]]; then
-    BODY_HTTP=$(replace_domain "$BODY_HTTP" "$old" "$new")
-    BODY_HTTPS=$(replace_domain "$BODY_HTTPS" "$old" "$new")
-  fi
-
   info "renaming $old -> $new"
   # 1. the new site, plain HTTP first so certbot can validate it
   DOMAIN=$new; ALIASES="${new_aliases[*]}"; SSL=0; CERT_FILE=""; CERT_KEY=""
@@ -1086,6 +1084,15 @@ cmd_rename() {
     if [[ -d $old_root ]]; then
       [[ -e $ROOT ]] && die "$ROOT already exists; use --keep-root or move it away"
       if (( redirect )); then run cp -a "$old_root" "$ROOT"; else run mv "$old_root" "$ROOT"; moved_root=1; fi
+    fi
+  fi
+  if [[ $TYPE == custom ]]; then
+    BODY_HTTP=$(replace_domain "$BODY_HTTP" "$old" "$new")
+    BODY_HTTPS=$(replace_domain "$BODY_HTTPS" "$old" "$new")
+    # the kept directives name the web root themselves; follow it only if it moved
+    if [[ -n $old_root && $ROOT != "$old_root" ]]; then
+      BODY_HTTP=$(replace_path "$BODY_HTTP" "$old_root" "$ROOT")
+      BODY_HTTPS=$(replace_path "$BODY_HTTPS" "$old_root" "$ROOT")
     fi
   fi
   apply_site
