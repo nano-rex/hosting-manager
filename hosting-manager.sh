@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -722,12 +722,22 @@ issue_cert() {
   local staging=${1:-0} args=() name
   have certbot || (( DRY_RUN )) || [[ $FAKE == 1 ]] || die "certbot is not installed (try: $PROG install certbot)"
   # shellcheck disable=SC2046
-  check_dns $(server_names) || return 1
-  for name in $(server_names); do args+=(-d "$name"); done
+  local names=() skipped=()
+  for name in $(server_names); do
+    # ssl --expect-ip: leave out names that don't point at this server yet
+    if [[ -n ${CERT_IP:-} ]] && ! names_resolve "$CERT_IP" "$name"; then skipped+=("$name"); else names+=("$name"); fi
+  done
+  if (( ${#skipped[@]} )); then
+    warn "left out of the certificate (not pointing at $CERT_IP yet): ${skipped[*]}"
+    warn "run '$PROG ssl $DOMAIN' again once they do, to add them"
+  fi
+  (( ${#names[@]} )) || { warn "none of the names point at $CERT_IP yet"; return 1; }
+  check_dns "${names[@]}" || return 1
+  for name in "${names[@]}"; do args+=(-d "$name"); done
   if [[ -n $EMAIL ]]; then args+=(--email "$EMAIL")
   else args+=(--register-unsafely-without-email); fi
   (( staging )) && args+=(--staging)
-  info "requesting a Let's Encrypt certificate for: $(server_names)"
+  info "requesting a Let's Encrypt certificate for: ${names[*]}"
   [[ $FAKE == 1 && -n ${HM_FAKE_CERT_FAIL:-} ]] && { warn "(test) certbot failed"; return 1; }
   run certbot certonly --webroot -w "$ACME_ROOT" --cert-name "$DOMAIN" \
     --non-interactive --agree-tos --keep-until-expiring \
@@ -1209,13 +1219,14 @@ cmd_alias() {
 }
 
 cmd_ssl() {
-  [[ $# -ge 1 ]] || die "usage: $PROG ssl <domain> [--off] [--staging] [--email ADDR]"
+  [[ $# -ge 1 ]] || die "usage: $PROG ssl <domain> [--off] [--staging] [--email ADDR] [--expect-ip IP]"
   local domain=${1,,} off=0 staging=0; shift
   while (($#)); do
     case $1 in
       --off) off=1 ;;
       --staging) staging=1 ;;
       --email) EMAIL=$2; shift ;;
+      --expect-ip) CERT_IP=$2; shift ;;
       *) die "unknown option: $1" ;;
     esac; shift
   done
@@ -1918,6 +1929,8 @@ Sites
 Certificates (Let's Encrypt via certbot)
   ssl <domain> [--staging] [--email ADDR]   enable HTTPS
   ssl <domain> --off              back to plain HTTP
+      --expect-ip IP              only certify the names that already resolve to IP
+                                  (the rest are added by running ssl again later)
   renew [--test]                  renew certificates (certbot also does this on a timer)
   certs                           list certificates
 

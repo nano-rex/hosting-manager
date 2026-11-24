@@ -262,6 +262,7 @@ hosting-manager [--dry-run] [-y] <command> [arguments]
 | `default <domain>` | The site that answers names no other site claims |
 | `ssl <domain> [--staging] [--email ADDR]` | Get a certificate and enable HTTPS |
 | `ssl <domain> --off` | Disable HTTPS (certificate kept) |
+| `ssl <domain> --expect-ip IP` | Certificate for only the names that already point at IP; the others (e.g. a second domain whose DNS isn't fixed yet) are left out until `ssl` is run again |
 | `renew [--test]` | Run `certbot renew` (`--test` = certbot `--dry-run`) |
 | `certs` | List certificates |
 | `install nginx\|apache\|certbot\|php` | Install packages and start services |

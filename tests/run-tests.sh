@@ -133,6 +133,10 @@ cp "$T/etc/apache2/sites-available/keep.legacy.test.conf" "$T/keep-before.conf"
 HM_FAKE_CERT_FAIL=1 hm rename keep.legacy.test keep.newname.test || true
 # rename an adopted HTTPS site whose directives mention its own name
 hm rename pay.legacy.test pay.newname.test --force
+# ssl --expect-ip: only the names that point here go on the certificate
+hm create part.legacy.test --server apache --proxy 7002 --no-www --alias part.other.test
+echo "part.legacy.test 192.0.2.9" > "$T/dns2"; echo "part.other.test 198.51.100.1" >> "$T/dns2"
+HM_FAKE_DNS=$T/dns2 bash "$HM" ssl part.legacy.test --expect-ip 192.0.2.9 > "$T/part.log" 2>&1 || true
 # a site whose web root folder is named after it: files stay, so the path must too
 hm rename old23.legacy.test old23.newname.test
 
@@ -154,7 +158,7 @@ check "apache php handler"               "grep -q 'proxy:unix:/run/php/php-fpm.s
 check "apache https upstream"            "grep -q 'SSLProxyEngine on' $a/sites-available/a-proxy.test.conf"
 check "apache upload limit"              "grep -q 'LimitRequestBody 10485760' $a/sites-available/a-plain.test.conf"
 check "apache rename without redirect"   "[[ ! -e $a/sites-available/a-old.test.conf && -f $a/sites-available/a-new.test.conf ]]"
-check "list shows 20 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 20 ]]"
+check "list shows 21 sites"              "[[ \$(bash $HM list | grep -c '\.test ') -eq 21 ]]"
 check "adopt: one file per site"         "[[ -f $a/sites-available/shop.legacy.test.conf && -f $a/sites-available/blog.legacy.test.conf ]]"
 check "adopt: port and directives kept"  "grep -q '<VirtualHost \*:3000>' $a/sites-available/shop.legacy.test.conf && grep -q 'php_admin_value open_basedir' $a/sites-available/shop.legacy.test.conf"
 check "adopt: aliases kept"              "grep -q 'ServerAlias www.shop.legacy.test' $a/sites-available/shop.legacy.test.conf"
@@ -173,6 +177,7 @@ check "relocate: service rewritten"     "grep -q 'WorkingDirectory=$T/www/legacy
 check "rename adopted: names in body"    "grep -q 'RewriteCond %{SERVER_NAME} =pay.newname.test' $a/sites-available/pay.newname.test.conf && grep -q 'ServerAlias www.pay.newname.test' $a/sites-available/pay.newname.test.conf"
 check "rename: paths keep the old name"  "grep -q 'DocumentRoot /srv/sites/old23.legacy.test' $a/sites-available/old23.newname.test.conf && grep -q 'ErrorLog /var/log/apache2/old23.legacy.test-error.log' $a/sites-available/old23.newname.test.conf"
 check "rename: URLs get the new name"   "grep -q 'Redirect 302 /go https://old23.newname.test/landing' $a/sites-available/old23.newname.test.conf && grep -q 'ServerName old23.newname.test' $a/sites-available/old23.newname.test.conf"
+check "ssl --expect-ip: skips other IPs"  "grep -q 'left out of the certificate.*part.other.test' $T/part.log && grep -q 'certificate for: part.legacy.test\$' $T/part.log"
 check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
 check "check is its own command"         "bash $HM check >/dev/null 2>&1 && ! bash $HM check | grep -q '^hosting-manager '"
 check "wait-dns: renamed after DNS"     "[[ -f $a/sites-available/hub.newname.test.conf && ! -e $a/sites-available/hub.legacy.test.conf ]] && grep -q 'SSLCertificateFile $T/le/live/hub.newname.test' $a/sites-available/hub.newname.test.conf"
