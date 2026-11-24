@@ -199,6 +199,18 @@ sudo hosting-manager adopt --all               # or: adopt example.com shop.exam
 Adopted sites show up as type `custom`. `alias`, `ssl`, `rename`, `enable`/`disable`, `remove`
 and `update --root` work on them; `update --php` / `--proxy` replaces their directives.
 
+To change an adopted site's directives, edit `/etc/hosting-manager/sites/<domain>.http`
+(or `.https`) and run `sudo hosting-manager update <domain>`: it rewrites the config,
+runs the config test and puts the old file back if the test fails. A redirect to HTTPS that
+should work for every name of the site uses the name the visitor asked for, and lets
+certificate checks through:
+
+```apache
+RewriteEngine on
+RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [R=301,L,NE]
+```
+
 ### Move site files to another folder
 
 `relocate` copies a folder, switches every site whose config mentions it, and checks the sites
