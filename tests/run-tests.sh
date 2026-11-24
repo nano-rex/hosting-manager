@@ -179,6 +179,7 @@ check "rename: paths keep the old name"  "grep -q 'DocumentRoot /srv/sites/old23
 check "rename: URLs get the new name"   "grep -q 'Redirect 302 /go https://old23.newname.test/landing' $a/sites-available/old23.newname.test.conf && grep -q 'ServerName old23.newname.test' $a/sites-available/old23.newname.test.conf"
 check "ssl --expect-ip: skips other IPs"  "grep -q 'left out of the certificate.*part.other.test' $T/part.log && grep -q 'certificate for: part.legacy.test\$' $T/part.log"
 check "rename adopted: old site gone"    "[[ ! -e $a/sites-available/pay.legacy.test.conf ]]"
+check "--dns-server option accepted"     "bash $HM --dns-server 192.0.2.1 list >/dev/null 2>&1"
 check "check is its own command"         "bash $HM check >/dev/null 2>&1 && ! bash $HM check | grep -q '^hosting-manager '"
 check "wait-dns: renamed after DNS"     "[[ -f $a/sites-available/hub.newname.test.conf && ! -e $a/sites-available/hub.legacy.test.conf ]] && grep -q 'SSLCertificateFile $T/le/live/hub.newname.test' $a/sites-available/hub.newname.test.conf"
 check "units: host name, not path"       "grep -q 'ExecStart=/usr/bin/hub -r hub.newname.test:21117' $T/etc/systemd/system/hub.service && grep -q 'WorkingDirectory=/srv/hub.legacy.test' $T/etc/systemd/system/hub.service"

@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.4.3"
+VERSION="0.4.4"
 PROG="hosting-manager"
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,7 @@ CONFIG_FILE="$STATE_DIR/hosting-manager.conf"
 DEFAULT_SERVER=""
 EMAIL=""
 DRY_RUN=0
+DNS_SERVER="${HM_DNS_SERVER:-}"
 ASSUME_YES=0
 BATCH=0            # 1 = callers test and reload once after many apply_site calls
 
@@ -704,11 +705,23 @@ unapply_site() {
 # ---------------------------------------------------------------------------
 # Certificates
 # ---------------------------------------------------------------------------
+# lookup NAME [4]: the addresses NAME resolves to (IPv4 only with 4), one per
+# line, from the system resolver or from --dns-server when given (useful when
+# the local resolver still caches an old "no such name" answer).
+lookup() {
+  if [[ -n $DNS_SERVER ]]; then
+    { dig +short A "$1" @"$DNS_SERVER"; [[ ${2:-} == 4 ]] || dig +short AAAA "$1" @"$DNS_SERVER"; } 2>/dev/null |
+      grep -E '^([0-9]+\.){3}[0-9]+$|:' | sort -u || true
+  else
+    getent "ahosts${2:+v4}" "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+  fi
+}
+
 check_dns() {
   [[ $FAKE == 1 ]] && return 0
   local name bad=()
   for name in "$@"; do
-    getent ahosts "$name" >/dev/null 2>&1 || bad+=("$name")
+    [[ -n $(lookup "$name") ]] || bad+=("$name")
   done
   if (( ${#bad[@]} )); then
     warn "these names do not resolve in DNS yet: ${bad[*]}"
@@ -1164,7 +1177,7 @@ names_resolve() {
   [[ $FAKE == 1 && -z ${HM_FAKE_DNS:-} ]] && return 0
   for n in "$@"; do
     if [[ -n ${HM_FAKE_DNS:-} ]]; then addrs=$(grep -F "$n " "$HM_FAKE_DNS" 2>/dev/null | awk '{print $2}' || true)
-    else addrs=$(getent ahostsv4 "$n" 2>/dev/null | awk '{print $1}' | sort -u || true); fi
+    else addrs=$(lookup "$n" 4); fi
     [[ -n $addrs ]] || return 1
     [[ -z $want ]] || grep -qxF "$want" <<<"$addrs" || return 1
   done
@@ -1944,6 +1957,8 @@ Server
 Global options
   --dry-run                       show what would change, change nothing
   -y, --yes                       don't ask for confirmation
+  --dns-server IP                 check DNS with this server (e.g. 1.1.1.1) instead of the
+                                  system resolver, when that still remembers an old answer
 
 Examples
   sudo $PROG create example.com --ssl --email me@example.com
@@ -1960,9 +1975,12 @@ main() {
     case $1 in
       --dry-run|-n) DRY_RUN=1; shift ;;
       -y|--yes) ASSUME_YES=1; shift ;;
+      --dns-server) [[ -n ${2:-} ]] || die "--dns-server needs an address"
+        DNS_SERVER=$2; export HM_DNS_SERVER=$2; shift 2 ;;
       *) break ;;
     esac
   done
+  if [[ -n $DNS_SERVER ]] && ! have dig; then die "--dns-server needs dig (apt install bind9-dnsutils)"; fi
   local cmd=${1:-help}; shift || true
   # allow global options after the command too
   local args=() a

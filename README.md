@@ -289,8 +289,10 @@ Options for `create` and `update`:
 | `--max-body SIZE` | Upload size limit, e.g. `64M` (`none` clears it on `update`) |
 | `--disabled` | Write the config without enabling it (`create` only) |
 
-Global options: `--dry-run` (change nothing, print everything), `-y` / `--yes` (don't ask
-for confirmation).
+Global options (before the command): `--dry-run` (change nothing, print everything),
+`-y` / `--yes` (don't ask for confirmation), `--dns-server IP` (check DNS with that server,
+e.g. `1.1.1.1`, instead of the system resolver: useful right after a DNS change, when the
+local resolver or router still remembers the old answer; needs `dig`).
 
 ## Where things are
 
